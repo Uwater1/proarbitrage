@@ -23,9 +23,9 @@
   - [x] Compile and execute integration test binary (`src/bin/main.rs`) verifying full logic and microsecond-level latency benchmarks.
 
 - [ ] **Phase 5: Unified Tree Scoring Model**
-  - [ ] Extract target returns (1m to 10m forward mid-price changes) from tick history.
-  - [ ] Train unified XGBoost/LightGBM model on historical parquet data.
-  - [ ] Export model to C (Treelite) or ONNX format for fast inference.
+  - [x] Extract target returns (1m to 10m forward mid-price changes) from tick history (implemented via `src/bin/extract_features.rs`).
+  - [x] Train unified XGBoost/LightGBM model on historical parquet data (implemented via GPU-enabled `train_xgboost.py`).
+  - [x] Export model to C (Treelite) or ONNX format for fast inference (integrated ONNX & UBJ export in python pipeline).
   - [ ] Set up compiled tree model inference pipeline in Rust using Candle or bindings.
 
 - [ ] **Phase 6: Multi-Greek Constrained Portfolio LP**
