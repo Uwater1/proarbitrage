@@ -26,7 +26,11 @@ To run expected-return predictions without sacrificing sub-10ms latency, the sys
 
 The high-speed extraction binary (`src/bin/extract_features.rs`) loads ticks, builds chronological strike-expiry option grids, calibrates the arbitrage-free surface in Rust, scores execution edge against the pre-inference liquidity gate ($D_i > \lambda$), searches forward in time to match future mid-prices, and writes the dataset to a structured CSV file.
 
-To compile the extraction binary:
+> [!WARNING]
+> **CRITICAL PERFORMANCE REQUIREMENT:** You **MUST** compile and run this binary in **Release Mode** (`--release`).
+> Rust debug mode compiles without optimizations, causing math-heavy libraries (like the `minilp` simplex solver) to run **50x to 100x slower**, leading to >1 hour runtimes.
+
+To compile the extraction binary in release mode:
 ```bash
 cargo build --release --bin extract_features
 ```

@@ -29,31 +29,57 @@ fn parse_date(s: &str) -> Option<NaiveDateTime> {
     None
 }
 
-fn find_future_grid_index(
-    k: usize,
-    grid_times: &[Option<NaiveDateTime>],
+struct ValidGrid<'a> {
+    index: usize,
+    time: NaiveDateTime,
+    grid: &'a OptionGrid,
+}
+
+struct TargetPointer {
+    ptr: usize,
     target_seconds: i64,
     tolerance_seconds: i64,
-) -> Option<usize> {
-    let current_time = grid_times[k]?;
-    let target_time = current_time + chrono::Duration::seconds(target_seconds);
-    
-    let mut best_idx = None;
-    let mut min_diff = i64::MAX;
+}
 
-    for i in (k + 1)..grid_times.len() {
-        if let Some(t) = grid_times[i] {
+impl TargetPointer {
+    fn new(target_seconds: i64, tolerance_seconds: i64) -> Self {
+        Self {
+            ptr: 0,
+            target_seconds,
+            tolerance_seconds,
+        }
+    }
+
+    fn advance(&mut self, current_time: NaiveDateTime, valid_grids: &[ValidGrid]) -> Option<usize> {
+        let target_time = current_time + chrono::Duration::seconds(self.target_seconds);
+        let start_time = target_time - chrono::Duration::seconds(self.tolerance_seconds);
+        
+        // Move sliding pointer forward to target_time - tolerance
+        while self.ptr < valid_grids.len() && valid_grids[self.ptr].time < start_time {
+            self.ptr += 1;
+        }
+        
+        let mut best_idx = None;
+        let mut min_diff = i64::MAX;
+        let mut scan_ptr = self.ptr;
+        
+        // Look within the tolerance window
+        while scan_ptr < valid_grids.len() {
+            let t = valid_grids[scan_ptr].time;
             let diff = (t - target_time).num_seconds().abs();
-            if diff < min_diff && diff <= tolerance_seconds {
-                min_diff = diff;
-                best_idx = Some(i);
-            }
-            if t > target_time + chrono::Duration::seconds(tolerance_seconds) {
+            if diff <= self.tolerance_seconds {
+                if diff < min_diff {
+                    min_diff = diff;
+                    best_idx = Some(valid_grids[scan_ptr].index);
+                }
+                scan_ptr += 1;
+            } else {
                 break;
             }
         }
+        
+        best_idx
     }
-    best_idx
 }
 
 fn find_future_mid(grid: &OptionGrid, option_type: char, strike: f64, expiry: &str) -> Option<f64> {
@@ -69,7 +95,7 @@ fn find_future_mid(grid: &OptionGrid, option_type: char, strike: f64, expiry: &s
 }
 
 fn main() -> anyhow::Result<()> {
-    println!("=== proarbitrage feature and target return extraction ===");
+    println!("=== proarbitrage high-speed feature and target extraction ===");
 
     // Parse arguments manually to avoid clap rebuild overhead
     let args: Vec<String> = env::args().collect();
@@ -128,8 +154,18 @@ fn main() -> anyhow::Result<()> {
     let grids = reconstruct_grids(&ticks);
     println!("Reconstructed {} chronological grids", grids.len());
 
-    // 3. Pre-parse times for grids
-    let grid_times: Vec<Option<NaiveDateTime>> = grids.iter().map(|g| parse_date(&g.date)).collect();
+    // 3. Pre-parse and filter grids that have valid times
+    let mut valid_grids = Vec::with_capacity(grids.len());
+    for (idx, grid) in grids.iter().enumerate() {
+        if let Some(time) = parse_date(&grid.date) {
+            valid_grids.push(ValidGrid {
+                index: idx,
+                time,
+                grid,
+            });
+        }
+    }
+    println!("Found {} valid grids with parsed timestamps.", valid_grids.len());
 
     // 4. Open output CSV
     let file = File::create(&output_path)?;
@@ -146,10 +182,18 @@ fn main() -> anyhow::Result<()> {
     let lambda_reg = 0.0001;
     let lambda_gate = 0.0005; // 5 bps
 
+    // Initialize monotonically sliding window pointers
+    let mut pointer_1m = TargetPointer::new(60, 30);
+    let mut pointer_3m = TargetPointer::new(180, 30);
+    let mut pointer_5m = TargetPointer::new(300, 30);
+    let mut pointer_10m = TargetPointer::new(600, 30);
+
     let start_extract = Instant::now();
     let mut total_records = 0;
 
-    for (k, grid) in grids.iter().enumerate() {
+    for (k, vg) in valid_grids.iter().enumerate() {
+        let grid = vg.grid;
+        
         // Calculate activation score
         let score = compute_activation_score(grid, &current_surface, &config);
         let should_calibrate = current_surface.is_none() || score > config.tau_enter;
@@ -161,11 +205,11 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let Some(ref surface) = current_surface {
-            // Find future grid indices for 1m (60s), 3m (180s), 5m (300s), 10m (600s)
-            let idx_1m = find_future_grid_index(k, &grid_times, 60, 30);
-            let idx_3m = find_future_grid_index(k, &grid_times, 180, 30);
-            let idx_5m = find_future_grid_index(k, &grid_times, 300, 30);
-            let idx_10m = find_future_grid_index(k, &grid_times, 600, 30);
+            // Find future grid indices using high-speed sliding window
+            let idx_1m = pointer_1m.advance(vg.time, &valid_grids);
+            let idx_3m = pointer_3m.advance(vg.time, &valid_grids);
+            let idx_5m = pointer_5m.advance(vg.time, &valid_grids);
+            let idx_10m = pointer_10m.advance(vg.time, &valid_grids);
 
             for contract in &grid.contracts {
                 if let Some(feat) = extract_candidate_features(contract, surface, lambda_gate) {
@@ -206,8 +250,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        if k > 0 && k % 1000 == 0 {
-            println!("Processed {} grids, extracted {} records...", k, total_records);
+        if k > 0 && k % 50000 == 0 {
+            println!("Processed {} valid grids, extracted {} records...", k, total_records);
         }
     }
 
