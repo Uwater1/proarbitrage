@@ -37,11 +37,11 @@ cargo build --release --bin extract_features
 
 To run feature extraction on the Huatai CSI 300 ETF Options dataset (`510300`):
 ```bash
-# Run on the full dataset
+# Run on the full dataset (has 33757074 would always take too long)
 ./target/release/extract_features --input data/510300_surface.parquet --output data/510300_extracted.csv
 
-# Run with a limit of rows for quick testing
-./target/release/extract_features --input data/510300_surface.parquet --output data/510300_extracted_subset.csv --limit 100000
+# Run with a limit of rows for quick testing (about 1 minute)
+./target/release/extract_features --input data/510300_surface.parquet --output data/510300_extracted_subset.csv --limit 1000000
 ```
 
 To run on the China Southern CSI 500 ETF Options dataset (`510500`):
