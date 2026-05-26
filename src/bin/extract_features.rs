@@ -184,7 +184,7 @@ fn main() -> anyhow::Result<()> {
 
                         writeln!(
                             writer,
-                            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                            "{},{},{:.4},{},{:.5},{:.4},{:.4},{:.5},{:.0},{:.5},{:.5},{:.5},{:.5},{:.5}",
                             grid.date,
                             contract.option_type,
                             contract.strike,
