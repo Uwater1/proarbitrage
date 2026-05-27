@@ -1,12 +1,14 @@
 use anyhow::{Result, Context};
 use polars::prelude::*;
+use std::sync::Arc;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct OptionTick {
-    pub date: String,
+    pub date: Arc<str>,
     pub option_type: char, // 'C' or 'P'
     pub strike: f64,
-    pub expiry: String,
+    pub expiry: Arc<str>,
     pub days_to_maturity: f64,
     pub tau: f64,
     pub s_t: f64,
@@ -22,7 +24,7 @@ pub struct OptionTick {
 
 #[derive(Debug, Clone)]
 pub struct OptionGrid {
-    pub date: String,
+    pub date: Arc<str>,
     pub s_t: f64,
     pub contracts: Vec<OptionTick>,
 }
@@ -87,12 +89,29 @@ pub fn load_ticks_from_parquet(path: &str, limit: Option<usize>) -> Result<Vec<O
     let liquid_series = df.column("is_liquid")?.cast(&DataType::Boolean)?;
     let liquid_chunked = liquid_series.bool()?;
 
+    let mut expiry_cache: HashMap<String, Arc<str>> = HashMap::with_capacity(8);
+    let mut last_date_str = String::new();
+    let mut last_date_arc: Arc<str> = Arc::from("");
+
     for i in 0..n_rows {
-        let date = date_chunked.get(i).unwrap_or("").to_string();
+        let date_str = date_chunked.get(i).unwrap_or("");
+        let date = if date_str == last_date_str {
+            last_date_arc.clone()
+        } else {
+            last_date_str = date_str.to_string();
+            last_date_arc = Arc::from(date_str);
+            last_date_arc.clone()
+        };
+
         let opt_type_str = type_chunked.get(i).unwrap_or("C");
         let option_type = opt_type_str.chars().next().unwrap_or('C');
         let strike = strike_chunked.get(i).unwrap_or(0.0);
-        let expiry = expiry_chunked.get(i).unwrap_or("").to_string();
+
+        let expiry_str = expiry_chunked.get(i).unwrap_or("");
+        let expiry = expiry_cache.entry(expiry_str.to_string())
+            .or_insert_with(|| Arc::from(expiry_str))
+            .clone();
+
         let days_to_maturity = days_chunked.get(i).unwrap_or(0.0);
         let tau = tau_chunked.get(i).unwrap_or(0.0);
         let s_t = st_chunked.get(i).unwrap_or(0.0);

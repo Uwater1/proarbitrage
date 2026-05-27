@@ -3,6 +3,7 @@ use crate::calibration::CalibrationSurface;
 use anyhow::{Result, bail};
 use good_lp::{variables, variable, default_solver, Solver, Solution, Expression, constraint, SolverModel};
 use std::collections::{HashMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct LegConfig {
@@ -26,135 +27,167 @@ pub struct ActiveStructure {
     pub expected_fee: f64,
 }
 
+struct StrikeInfo {
+    strike_micro: u64,
+    call_idx: Option<usize>,
+    put_idx: Option<usize>,
+}
+
 /// Dynamically generate and map all active options-only arbitrage structures
 pub fn generate_active_structures(
     grid: &OptionGrid,
     fee_per_contract: f64,
 ) -> Vec<ActiveStructure> {
-    let mut expiries: HashMap<String, Vec<(usize, &crate::ingestion::OptionTick)>> = HashMap::new();
+    // Group contracts by expiry in a flat Vec
+    let mut expiries: Vec<(Arc<str>, Vec<(usize, &crate::ingestion::OptionTick)>)> = Vec::with_capacity(4);
+
     for (idx, c) in grid.contracts.iter().enumerate() {
-        expiries.entry(c.expiry.clone()).or_default().push((idx, c));
+        if let Some(pos) = expiries.iter().position(|e| e.0 == c.expiry) {
+            expiries[pos].1.push((idx, c));
+        } else {
+            expiries.push((c.expiry.clone(), vec![(idx, c)]));
+        }
     }
 
     let mut active_structs = Vec::new();
 
     for (expiry, items) in expiries {
-        let mut strike_map: HashMap<u64, HashMap<char, usize>> = HashMap::new();
-        let mut unique_strikes = BTreeSet::new();
+        let mut strikes: Vec<StrikeInfo> = Vec::with_capacity(32);
+
         for &(idx, c) in &items {
-            let key = (c.strike * 1_000_000.0).round() as u64;
-            unique_strikes.insert(key);
-            strike_map.entry(key).or_default().insert(c.option_type, idx);
-        }
-
-        let strikes: Vec<u64> = unique_strikes.into_iter().collect();
-        if strikes.len() < 2 {
-            continue;
-        }
-
-        // A. Box Arbitrage: strikes K1 < K2 (adjacent in grid)
-        for i in 0..strikes.len() - 1 {
-            let k1 = strikes[i];
-            let k2 = strikes[i + 1];
-            
-            let k1_f = k1 as f64 / 1_000_000.0;
-            let k2_f = k2 as f64 / 1_000_000.0;
-
-            if let (Some(&c1_c), Some(&c2_c), Some(&c1_p), Some(&c2_p)) = (
-                strike_map.get(&k1).and_then(|m| m.get(&'C')),
-                strike_map.get(&k2).and_then(|m| m.get(&'C')),
-                strike_map.get(&k1).and_then(|m| m.get(&'P')),
-                strike_map.get(&k2).and_then(|m| m.get(&'P')),
-            ) {
-                active_structs.push(ActiveStructure {
-                    name: format!("Box_{}_{:.3}_{:.3}", expiry, k1_f, k2_f),
-                    legs: vec![
-                        (c1_c, 1.0),
-                        (c2_c, -1.0),
-                        (c2_p, 1.0),
-                        (c1_p, -1.0),
-                    ],
-                    expected_fee: 4.0 * fee_per_contract,
+            let strike_micro = (c.strike * 1_000_000.0).round() as u64;
+            if let Some(pos) = strikes.iter().position(|s| s.strike_micro == strike_micro) {
+                if c.option_type == 'C' {
+                    strikes[pos].call_idx = Some(idx);
+                } else {
+                    strikes[pos].put_idx = Some(idx);
+                }
+            } else {
+                strikes.push(StrikeInfo {
+                    strike_micro,
+                    call_idx: if c.option_type == 'C' { Some(idx) } else { None },
+                    put_idx: if c.option_type == 'P' { Some(idx) } else { None },
                 });
             }
         }
 
-        // B. Butterfly Spread: 3 consecutive equal-interval strikes K1 < K2 < K3
+        // Sort strikes chronologically
+        strikes.sort_by_key(|s| s.strike_micro);
+
+        if strikes.len() < 2 {
+            continue;
+        }
+
+        // A. Box Arbitrage: strikes K_i < K_j (allow adjacent and 1-strike gap, index difference <= 2)
+        for i in 0..strikes.len() - 1 {
+            let limit_j = (i + 3).min(strikes.len());
+            for j in (i + 1)..limit_j {
+                let s1 = &strikes[i];
+                let s2 = &strikes[j];
+                
+                let k1_f = s1.strike_micro as f64 / 1_000_000.0;
+                let k2_f = s2.strike_micro as f64 / 1_000_000.0;
+
+                if let (Some(c1_c), Some(c2_c), Some(c1_p), Some(c2_p)) = (
+                    s1.call_idx,
+                    s2.call_idx,
+                    s1.put_idx,
+                    s2.put_idx,
+                ) {
+                    active_structs.push(ActiveStructure {
+                        name: format!("Box_{}_{:.3}_{:.3}", expiry, k1_f, k2_f),
+                        legs: vec![
+                            (c1_c, 1.0),
+                            (c2_c, -1.0),
+                            (c2_p, 1.0),
+                            (c1_p, -1.0),
+                        ],
+                        expected_fee: 4.0 * fee_per_contract,
+                    });
+                }
+            }
+        }
+
+        // B. Butterfly Spread: equal-interval strikes K_i < K_j < K_k (index limit <= 4 steps)
         if strikes.len() >= 3 {
             for i in 0..strikes.len() - 2 {
-                let k1 = strikes[i];
-                let k2 = strikes[i + 1];
-                let k3 = strikes[i + 2];
+                let limit_k = (i + 5).min(strikes.len());
+                for j in (i + 1)..limit_k {
+                    for k in (j + 1)..limit_k {
+                        let s1 = &strikes[i];
+                        let s2 = &strikes[j];
+                        let s3 = &strikes[k];
 
-                let k1_f = k1 as f64 / 1_000_000.0;
-                let k2_f = k2 as f64 / 1_000_000.0;
-                let k3_f = k3 as f64 / 1_000_000.0;
+                        let k1_f = s1.strike_micro as f64 / 1_000_000.0;
+                        let k2_f = s2.strike_micro as f64 / 1_000_000.0;
+                        let k3_f = s3.strike_micro as f64 / 1_000_000.0;
 
-                if (k2 - k1) == (k3 - k2) {
-                    if let (Some(&c1), Some(&c2), Some(&c3)) = (
-                        strike_map.get(&k1).and_then(|m| m.get(&'C')),
-                        strike_map.get(&k2).and_then(|m| m.get(&'C')),
-                        strike_map.get(&k3).and_then(|m| m.get(&'C')),
-                    ) {
-                        active_structs.push(ActiveStructure {
-                            name: format!("C_Fly_{}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f),
-                            legs: vec![
-                                (c1, 1.0),
-                                (c2, -2.0),
-                                (c3, 1.0),
-                            ],
-                            expected_fee: 4.0 * fee_per_contract,
-                        });
-                    }
+                        if (s2.strike_micro - s1.strike_micro) == (s3.strike_micro - s2.strike_micro) {
+                            if let (Some(c1), Some(c2), Some(c3)) = (s1.call_idx, s2.call_idx, s3.call_idx) {
+                                active_structs.push(ActiveStructure {
+                                    name: format!("C_Fly_{}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f),
+                                    legs: vec![
+                                        (c1, 1.0),
+                                        (c2, -2.0),
+                                        (c3, 1.0),
+                                    ],
+                                    expected_fee: 4.0 * fee_per_contract,
+                                });
+                            }
 
-                    if let (Some(&c1), Some(&c2), Some(&c3)) = (
-                        strike_map.get(&k1).and_then(|m| m.get(&'P')),
-                        strike_map.get(&k2).and_then(|m| m.get(&'P')),
-                        strike_map.get(&k3).and_then(|m| m.get(&'P')),
-                    ) {
-                        active_structs.push(ActiveStructure {
-                            name: format!("P_Fly_{}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f),
-                            legs: vec![
-                                (c1, 1.0),
-                                (c2, -2.0),
-                                (c3, 1.0),
-                            ],
-                            expected_fee: 4.0 * fee_per_contract,
-                        });
+                            if let (Some(p1), Some(p2), Some(p3)) = (s1.put_idx, s2.put_idx, s3.put_idx) {
+                                active_structs.push(ActiveStructure {
+                                    name: format!("P_Fly_{}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f),
+                                    legs: vec![
+                                        (p1, 1.0),
+                                        (p2, -2.0),
+                                        (p3, 1.0),
+                                    ],
+                                    expected_fee: 4.0 * fee_per_contract,
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // C. Iron Condor: 4 consecutive strikes K1 < K2 < K3 < K4
+        // C. Iron Condor: strikes K_i < K_j < K_k < K_l (index limit <= 5 steps)
         if strikes.len() >= 4 {
             for i in 0..strikes.len() - 3 {
-                let k1 = strikes[i];
-                let k2 = strikes[i + 1];
-                let k3 = strikes[i + 2];
-                let k4 = strikes[i + 3];
+                let limit_l = (i + 6).min(strikes.len());
+                for j in (i + 1)..limit_l {
+                    for k in (j + 1)..limit_l {
+                        for l in (k + 1)..limit_l {
+                            let s1 = &strikes[i];
+                            let s2 = &strikes[j];
+                            let s3 = &strikes[k];
+                            let s4 = &strikes[l];
 
-                let k1_f = k1 as f64 / 1_000_000.0;
-                let k2_f = k2 as f64 / 1_000_000.0;
-                let k3_f = k3 as f64 / 1_000_000.0;
-                let k4_f = k4 as f64 / 1_000_000.0;
+                            let k1_f = s1.strike_micro as f64 / 1_000_000.0;
+                            let k2_f = s2.strike_micro as f64 / 1_000_000.0;
+                            let k3_f = s3.strike_micro as f64 / 1_000_000.0;
+                            let k4_f = s4.strike_micro as f64 / 1_000_000.0;
 
-                if let (Some(&c1_p), Some(&c2_p), Some(&c3_c), Some(&c4_c)) = (
-                    strike_map.get(&k1).and_then(|m| m.get(&'P')),
-                    strike_map.get(&k2).and_then(|m| m.get(&'P')),
-                    strike_map.get(&k3).and_then(|m| m.get(&'C')),
-                    strike_map.get(&k4).and_then(|m| m.get(&'C')),
-                ) {
-                    active_structs.push(ActiveStructure {
-                        name: format!("Condor_{}_{:.3}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f, k4_f),
-                        legs: vec![
-                            (c1_p, 1.0),
-                            (c2_p, -1.0),
-                            (c3_c, -1.0),
-                            (c4_c, 1.0),
-                        ],
-                        expected_fee: 4.0 * fee_per_contract,
-                    });
+                            if let (Some(p1), Some(p2), Some(c3), Some(c4)) = (
+                                s1.put_idx,
+                                s2.put_idx,
+                                s3.call_idx,
+                                s4.call_idx,
+                            ) {
+                                active_structs.push(ActiveStructure {
+                                    name: format!("Condor_{}_{:.3}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f, k4_f),
+                                    legs: vec![
+                                        (p1, 1.0),
+                                        (p2, -1.0),
+                                        (c3, -1.0),
+                                        (c4, 1.0),
+                                    ],
+                                    expected_fee: 4.0 * fee_per_contract,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -292,12 +325,10 @@ pub fn optimize_portfolio_structured(
 
 /// Scans grid for Box, Butterfly, and Iron Condor combinations with high XGBoost expected alpha
 pub fn scan_strict_arbitrage(
-    grid: &OptionGrid,
+    active_structs: &[ActiveStructure],
     alpha_scores: &[f64],
-    fee_per_contract: f64,
     profit_threshold: f64,
 ) -> Vec<(ActiveStructure, f64, f64)> {
-    let active_structs = generate_active_structures(grid, fee_per_contract);
     let mut profitable = Vec::new();
 
     for active_struct in active_structs {
@@ -312,9 +343,9 @@ pub fn scan_strict_arbitrage(
         let short_profit = -expected_alpha - fee_premium;
 
         if long_profit >= profit_threshold {
-            profitable.push((active_struct, long_profit, 1.0));
+            profitable.push((active_struct.clone(), long_profit, 1.0));
         } else if short_profit >= profit_threshold {
-            profitable.push((active_struct, short_profit, -1.0));
+            profitable.push((active_struct.clone(), short_profit, -1.0));
         }
     }
 

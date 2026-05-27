@@ -7,6 +7,7 @@ use std::io::{Write, BufWriter};
 use std::time::Instant;
 use std::env;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn parse_date(s: &str) -> Option<NaiveDateTime> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.3f") {
@@ -34,7 +35,7 @@ fn parse_date(s: &str) -> Option<NaiveDateTime> {
 struct ContractKey {
     option_type: char,
     strike_micro: u64,
-    expiry: String,
+    expiry: Arc<str>,
 }
 
 impl ContractKey {

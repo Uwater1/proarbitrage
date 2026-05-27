@@ -152,32 +152,31 @@ The engine dynamically scans the option grid and trades the following options-on
 * **Iron Condors**: Dynamic range premium writing utilizing portfolio margin offsets.
 
 ### Running the Backtester
-To run the comparative trading simulation on the A-share ETF options dataset:
+To run the chronological trading simulation on the A-share ETF options dataset:
 ```bash
 cargo run --release --bin backtest
 ```
 
-### High-Yield Simulation Comparison (150,000 Ticks)
-The backtester runs two parallel simulations over the historical ticks—one using Aggressive sweep execution (crossing the spread) and another using Passive limit order queueing (mid-market execution)—yielding fully profitable results:
+### Strict Aggressive Arbitrage Backtest Results (150,000 Ticks)
+The backtester runs historical ticks through the strict arbitrage scanner operating strictly in Aggressive Sweep Taker mode (crossing the spread) to completely eliminate leg-out risk, yielding a fully profitable net return:
 
 ```
-================== STRICT ARBITRAGE SIMULATION COMPARISON ==================
-  Execution Mode        | Aggressive Sweep (Crossing Spread) | Passive queue (Mid-market)
-  ----------------------|------------------------------------|---------------------------
-  Initial Capital       | 100,000.00 CNY                     | 100,000.00 CNY
-  Final Capital         | 100,452.65 CNY                     | 100,509.72 CNY
-  Net Profit / Loss     | +452.65 CNY                        | +509.72 CNY
-  Max Peak-to-Trough DD | 0.1494 %                           | 0.1470 %
-  Total Traded Contracts| 360                                | 380
-  Total Fees Paid       | 720.00 CNY                         | 760.00 CNY
-  Max Found Unit Profit | 0.120094 pt                        | 0.120094 pt
-  Simulation Latency    | 6503 ms                            | 6533 ms
-=============================================================================
+================== STRICT AGGRESSIVE ARBITRAGE BACKTEST RESULTS ==================
+  Execution Mode        | Aggressive Sweep (CROSSING SPREAD)
+  ----------------------|----------------------------------------------------
+  Initial Capital       | 100,000.00 CNY
+  Final Capital         | 100,452.65 CNY
+  Net Profit / Loss     | +452.65 CNY
+  Max Peak-to-Trough DD | 0.1494 %
+  Total Traded Contracts| 360
+  Total Fees Paid       | 720.00 CNY
+  Max Found Unit Profit | 0.120094 pt
+  Simulation Latency    | 6548 ms
+====================================================================================
 ```
 
 ### Key Performance Insights
-1. **Fully Profitable Yields**: By pivoting to strict arbitrage scanning, the engine achieved positive net profits under both execution modes (**+452.65 CNY** Aggressive, **+509.72 CNY** Passive).
-2. **Spread Capture Boost**: Passive mid-market queue execution increased profitability to **+509.72 CNY**, showing the critical advantage of avoiding aggressive spread crossing.
-3. **Exceptional Drawdown Control**: Maximum peak-to-trough drawdowns were capped under **0.1470%** due to the fully risk-hedged structure of options-only combinations.
-4. **Latency Verification**: The entire simulation loop processed 150,000 ticks (~67,954 expiry-strike grids) in under **6.6 seconds** (~96 us per grid tick), running well below the 10ms production target.
+1. **Fully Profitable Yields**: By pivoting to strict arbitrage scanning, the engine achieved positive net profits of **+452.65 CNY** while crossing the spread on all legs.
+2. **Exceptional Drawdown Control**: Maximum peak-to-trough drawdowns were capped under **0.1494%** due to the fully risk-hedged structure of options-only combinations.
+3. **Latency Verification**: The entire simulation loop processed 150,000 ticks (~67,954 expiry-strike grids) in under **6.6 seconds** (~96 us per grid tick), running well below the 10ms production target.
 

@@ -1,6 +1,7 @@
 use crate::ingestion::{OptionGrid, OptionTick};
 use crate::calibration::CalibrationSurface;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ActivationConfig {
@@ -32,7 +33,7 @@ pub fn compute_shape_violations(grid: &OptionGrid) -> f64 {
     let mut total_violation = 0.0;
 
     // Group contracts by expiry to check strike monotonicity and convexity
-    let mut by_expiry: HashMap<String, Vec<&OptionTick>> = HashMap::new();
+    let mut by_expiry: HashMap<Arc<str>, Vec<&OptionTick>> = HashMap::new();
     for contract in &grid.contracts {
         if contract.is_liquid {
             by_expiry.entry(contract.expiry.clone()).or_default().push(contract);

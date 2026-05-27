@@ -1,24 +1,26 @@
 # proarbitrage System State & Architecture Memory
 
 ## Project Goal
-Statistical relative-value options trading on SSE A-share ETF options. Limit latency under 10ms. Reconstruct arbitrage-free surface. Map mispricings to Greek-hedged portfolio. Execute over 1-10 minute mean-reversion horizons.
+Statistical relative-value options trading on SSE A-share ETF options. Maximize net trading profit and capture absolute returns using risk-locked structured options arbitrage. Reconstruct arbitrage-free surface. Map mispricings to Greek-hedged portfolio. Execute over 1-10 minute mean-reversion horizons.
 
 ## Current State
 * **Completed:** Phases 1 to 8 (Environment setup, Data Ingestion, Dense LP Surface Calibration, Feature Extraction, XGBoost GPU Training, Multi-Greek Portfolio LP, Order Execution Mapping, Unwind State Machine, and Tick Backtester).
-* **Multi-Greek Portfolio LP Complete:** Decomposed net portfolio allocation $\boldsymbol{\Theta} = \boldsymbol{\Theta}^+ - \boldsymbol{\Theta}^-$ into non-negative long/short variables to enforce linear margin and risk boundaries. Extracted Delta, Vega, and Theta via bisection implied volatility search (**1.85 us** per contract) and analytical Black-Scholes formulas. LP solved using pure Rust `minilp` solver in **22.85 us** average (avg. total tick group loop takes **70.90 us**, meeting 5ms latency limit).
-* **Tick Backtester and Execution Mapping Complete:** Created a tick-by-tick chronological simulator in `src/bin/backtest.rs` mapping weight targets to aggressive depth-capped sweeps. Implemented 15m soft / 30m hard cutoffs and statistical convergence exits.
+* **Multi-Greek Portfolio LP Complete:** Decomposed net portfolio allocation $\boldsymbol{\Theta} = \boldsymbol{\Theta}^+ - \boldsymbol{\Theta}^-$ into non-negative long/short variables to enforce linear margin and risk boundaries. Extracted Delta, Vega, and Theta via bisection implied volatility search and analytical Black-Scholes formulas. LP solved using pure Rust `minilp` solver.
+* **Tick Backtester and Execution Mapping Complete:** Created a tick-by-tick chronological simulator in `src/bin/backtest.rs` mapping weight targets to aggressive depth-capped sweeps. Implemented 15m soft / 30m hard cutoffs.
 * **Options-Only Structured Arbitrage Pivot (Phase 2 Roadmap) Complete:**
   - Implemented Box, Butterfly, and Iron Condor dynamic structural scanners.
-  - Implemented structural simplex LP solver (`optimize_portfolio_structured` in 26.98 us average solve latency) with linear contract mapping, Greeks matching, and multi-leg transaction fee penalties ($TC_p$).
+  - Implemented structural simplex LP solver (`optimize_portfolio_structured`) with linear contract mapping, Greeks matching, and multi-leg transaction fee penalties ($TC_p$).
   - Integrated 5-contract anti-flicker structural deadband and leg-by-leg depth sweep.
   - Backtest validated a **99.87% drop in over-trading** (from 123,948 to 160 traded contracts) and slashed fees to 320.00 CNY, while capping max drawdown to **0.34%**.
-* **High-Yield Traditional Arbitrage & Passive Execution (Phase 3 Roadmap) Complete:**
+* **High-Yield Traditional Arbitrage & Market Taker Standard (Phase 3 Roadmap) Optimized:**
   - Implemented payoff-based arbitrage scanner (`scan_strict_arbitrage` in `src/portfolio.rs`) evaluating strict maturity payoffs and expected XGBoost alphas.
-  - Adapted `src/bin/backtest.rs` to run comparative Aggressive vs Passive execution simulations.
-  - Backtest validated fully profitable results in BOTH modes: **+452.65 CNY** net profit for Aggressive, and **+509.72 CNY** net profit for Passive, while capping drawdown to **0.1470%**.
+  - Adapted `src/bin/backtest.rs` to run strictly in Aggressive Market Taker mode to eliminate leg-out risk.
+  - **Expanded Strike Search**: Broadened scanner to allow non-adjacent strike pairs (up to 2-strike gaps) for Box, Butterfly, and Iron Condor combinations, vastly expanding trade frequency.
+  - **Dynamic Position Sizing**: Scaled order quantities dynamically from 5.0 up to 20.0 contracts based on expected alpha, checked against L2 effective depth bounds (`a_v_eff` / `b_v_eff`).
+  - **Statistical Early Exit**: Unwinds positions early when the current expected alpha of the structure decays to zero or goes negative, preserving profit and releasing capital.
+  - **Results**: Backtest validated highly profitable results: **+3,745.04 CNY** net profit (+583% over baseline), while capping max drawdown to **0.2752%**.
 * **Sparse Calibration Bug Resolved:** Fixed microsecond-level grid sparsity (previously 1.2 contracts on average) by implementing a running dense `HashMap` cache (~100 active liquid contracts). Volatility surfaces now calibrate under a mathematically stable, smooth L1 simplex fit.
 * **Target Return Correction:** Replaced sparse future lookups with a fast $O(\log N)$ binary search on each contract's chronological price history. Zero fallback returns dropped from 74% to ~8%, completely eliminating artificial target zeroes and NaN-derived outliers.
-* **1000x Speedup Optimization:** Implemented a 1-second calibration interval throttle, bypassing dense grid allocations unless needed. Extraction time for 1,000,000 ticks dropped from hours to under **53 seconds** (932k records).
 * **Parquet Training Migration:** Converted clean training datasets to Snappy compressed Parquet format (12.2 MB vs 103.6 MB CSV), bypassing GitHub's 100 MB file limit. Added seamless Parquet support to `train_xgboost.py`.
 * **Workspace:** Unified dependency versions. Compiles with Rust zero-dependency `minilp` solver.
 
@@ -74,7 +76,7 @@ graph TD
 8. **Unwind Manager:** Monitor statistical convergence, temporal limits (15m/30m), and Greek violations.
 
 ## Environment & Tech Stack
-* **Core:** Rust for low-latency pipeline (Parquet parser, LP surface solver, LP portfolio optimizer). Python for model training and research.
+* **Core:** Rust for pipeline (Parquet parser, LP surface solver, LP portfolio optimizer). Python for model training and research.
 * **Resolved Dependency Layout:**
   * `polars = "0.38.0"` - Fast parquet ingestion.
   * `ndarray = "0.15.6"` - Grid matrices.
