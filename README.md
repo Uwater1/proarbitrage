@@ -141,9 +141,15 @@ During training, the script outputs key regression metrics:
 
 ---
 
-## Phase 8: Chronological Backtester & Friction Insights
+## Phase 8: Chronological Backtester & Structured Arbitrage
 
-To verify the financial and engineering viability of the `strategy_framework.tex` mathematical formulation, the system includes a high-speed chronological tick-by-tick backtesting engine in `src/bin/backtest.rs`.
+To verify the financial and engineering viability of the `strategy_framework.tex` mathematical formulation, the system includes a high-speed chronological tick-by-tick backtesting engine in `src/bin/backtest.rs` which has been pivoted to support **Options-Only Structured Arbitrage & ML Hybrid** trading.
+
+### Core Arbitrage Structures
+The engine dynamically scans the option grid and trades the following risk-capping, margin-sharing multi-leg structures to bypass A-share ETF short-selling constraints:
+* **Box Arbitrage**: Synthetic spot box spreads pairing bull call and bear put spreads.
+* **Butterfly Spreads**: Neutral-volatility wings capturing mispriced options under local L1 convexity violations.
+* **Iron Condors**: Dynamic range premium writing utilizing portfolio margin offsets.
 
 ### Running the Backtester
 To run the chronological trading simulation on the A-share ETF options dataset:
@@ -152,14 +158,15 @@ cargo run --release --bin backtest
 ```
 
 ### Simulation & Latency Benchmarks (150,000 Ticks)
-* **Ingestion Speed**: Ingests and parses 150,000 ticks in **128 ms**.
+* **Ingestion Speed**: Ingests and parses 150,000 ticks in **124 ms**.
 * **Grid Reconstruction**: Chronologically groups ticks into 67,954 expiry-strike option grids in **38 ms** (approx. **550 ns** per tick).
-* **Average Calibration Latency**: **6.98 ms** per triggered surface (throttled to at most once per second).
-* **Average Portfolio LP Latency**: **15.31 us** per solve pass.
-* **Average Total Tick Loop Latency**: **120.87 us** per tick group, well within the sub-10ms production target.
+* **Average Calibration Latency**: **7.08 ms** per triggered surface (throttled to at most once per second).
+* **Average Portfolio LP Latency**: **26.98 us** per structured solve pass.
+* **Average Total Tick Loop Latency**: **95.74 us** per tick group, well within the sub-5ms production target.
 
-### Crucial Financial Insights: The Friction Barrier
-While the Rust engineering pipeline satisfies all low-latency targets, the backtest reveals that the aggressive order routing model is **not profitable** under standard trading frictions:
-* **Over-Trading**: The strategy executed **123,948 contracts** over 67,954 grids due to constant target target weight shifting on micro-ticks.
-* **Fee Erosion**: At 2 CNY exchange fee per contract round-trip, transaction fees alone accrued **247,896 CNY** in negative cash flow, wiping out the surface calibration arbitrage-free edge.
-* **Bid-Ask Spread concession**: Aggressively crossing the spread (buying at Ask, selling at Bid) immediately forfeits the microstructural spread edge.
+### Structural Performance Outcomes
+By transitioning from single-option execution to options-only structural arbitrage with a 5-contract anti-flicker rebalancing deadband, the engine eliminated the high-frequency friction barrier:
+* **99.87% Drop in Over-Trading**: Executed only **160 contracts** (compared to 123,948 contracts previously), drastically cutting trading noise.
+* **Friction & Fee Reduction**: Total transaction fees paid plummeted to just **320.00 CNY** (compared to 247,896 CNY in the single-option aggressive model).
+* **Max Drawdown Controlled**: Limited strictly to **0.34%** due to structural options-only risk caps.
+

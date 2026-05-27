@@ -2,6 +2,293 @@ use crate::ingestion::OptionGrid;
 use crate::calibration::CalibrationSurface;
 use anyhow::{Result, bail};
 use good_lp::{variables, variable, default_solver, Solver, Solution, Expression, constraint, SolverModel};
+use std::collections::{HashMap, BTreeSet};
+
+#[derive(Debug, Clone)]
+pub struct LegConfig {
+    pub expiry: String,
+    pub strike: f64,
+    pub option_type: char, // 'C' or 'P'
+    pub weight: f64,       // +1.0 for buy, -1.0 for sell, etc.
+}
+
+#[derive(Debug, Clone)]
+pub struct ArbitrageStructure {
+    pub name: String,
+    pub legs: Vec<LegConfig>,
+    pub expected_fee: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveStructure {
+    pub name: String,
+    pub legs: Vec<(usize, f64)>, // (contract_index, weight)
+    pub expected_fee: f64,
+}
+
+/// Dynamically generate and map all active options-only arbitrage structures
+pub fn generate_active_structures(
+    grid: &OptionGrid,
+    fee_per_contract: f64,
+) -> Vec<ActiveStructure> {
+    let mut expiries: HashMap<String, Vec<(usize, &crate::ingestion::OptionTick)>> = HashMap::new();
+    for (idx, c) in grid.contracts.iter().enumerate() {
+        expiries.entry(c.expiry.clone()).or_default().push((idx, c));
+    }
+
+    let mut active_structs = Vec::new();
+
+    for (expiry, items) in expiries {
+        let mut strike_map: HashMap<u64, HashMap<char, usize>> = HashMap::new();
+        let mut unique_strikes = BTreeSet::new();
+        for &(idx, c) in &items {
+            let key = (c.strike * 1_000_000.0).round() as u64;
+            unique_strikes.insert(key);
+            strike_map.entry(key).or_default().insert(c.option_type, idx);
+        }
+
+        let strikes: Vec<u64> = unique_strikes.into_iter().collect();
+        if strikes.len() < 2 {
+            continue;
+        }
+
+        // A. Box Arbitrage: strikes K1 < K2 (adjacent in grid)
+        for i in 0..strikes.len() - 1 {
+            let k1 = strikes[i];
+            let k2 = strikes[i + 1];
+            
+            let k1_f = k1 as f64 / 1_000_000.0;
+            let k2_f = k2 as f64 / 1_000_000.0;
+
+            if let (Some(&c1_c), Some(&c2_c), Some(&c1_p), Some(&c2_p)) = (
+                strike_map.get(&k1).and_then(|m| m.get(&'C')),
+                strike_map.get(&k2).and_then(|m| m.get(&'C')),
+                strike_map.get(&k1).and_then(|m| m.get(&'P')),
+                strike_map.get(&k2).and_then(|m| m.get(&'P')),
+            ) {
+                active_structs.push(ActiveStructure {
+                    name: format!("Box_{}_{:.3}_{:.3}", expiry, k1_f, k2_f),
+                    legs: vec![
+                        (c1_c, 1.0),
+                        (c2_c, -1.0),
+                        (c2_p, 1.0),
+                        (c1_p, -1.0),
+                    ],
+                    expected_fee: 4.0 * fee_per_contract,
+                });
+            }
+        }
+
+        // B. Butterfly Spread: 3 consecutive equal-interval strikes K1 < K2 < K3
+        if strikes.len() >= 3 {
+            for i in 0..strikes.len() - 2 {
+                let k1 = strikes[i];
+                let k2 = strikes[i + 1];
+                let k3 = strikes[i + 2];
+
+                let k1_f = k1 as f64 / 1_000_000.0;
+                let k2_f = k2 as f64 / 1_000_000.0;
+                let k3_f = k3 as f64 / 1_000_000.0;
+
+                if (k2 - k1) == (k3 - k2) {
+                    if let (Some(&c1), Some(&c2), Some(&c3)) = (
+                        strike_map.get(&k1).and_then(|m| m.get(&'C')),
+                        strike_map.get(&k2).and_then(|m| m.get(&'C')),
+                        strike_map.get(&k3).and_then(|m| m.get(&'C')),
+                    ) {
+                        active_structs.push(ActiveStructure {
+                            name: format!("C_Fly_{}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f),
+                            legs: vec![
+                                (c1, 1.0),
+                                (c2, -2.0),
+                                (c3, 1.0),
+                            ],
+                            expected_fee: 4.0 * fee_per_contract,
+                        });
+                    }
+
+                    if let (Some(&c1), Some(&c2), Some(&c3)) = (
+                        strike_map.get(&k1).and_then(|m| m.get(&'P')),
+                        strike_map.get(&k2).and_then(|m| m.get(&'P')),
+                        strike_map.get(&k3).and_then(|m| m.get(&'P')),
+                    ) {
+                        active_structs.push(ActiveStructure {
+                            name: format!("P_Fly_{}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f),
+                            legs: vec![
+                                (c1, 1.0),
+                                (c2, -2.0),
+                                (c3, 1.0),
+                            ],
+                            expected_fee: 4.0 * fee_per_contract,
+                        });
+                    }
+                }
+            }
+        }
+
+        // C. Iron Condor: 4 consecutive strikes K1 < K2 < K3 < K4
+        if strikes.len() >= 4 {
+            for i in 0..strikes.len() - 3 {
+                let k1 = strikes[i];
+                let k2 = strikes[i + 1];
+                let k3 = strikes[i + 2];
+                let k4 = strikes[i + 3];
+
+                let k1_f = k1 as f64 / 1_000_000.0;
+                let k2_f = k2 as f64 / 1_000_000.0;
+                let k3_f = k3 as f64 / 1_000_000.0;
+                let k4_f = k4 as f64 / 1_000_000.0;
+
+                if let (Some(&c1_p), Some(&c2_p), Some(&c3_c), Some(&c4_c)) = (
+                    strike_map.get(&k1).and_then(|m| m.get(&'P')),
+                    strike_map.get(&k2).and_then(|m| m.get(&'P')),
+                    strike_map.get(&k3).and_then(|m| m.get(&'C')),
+                    strike_map.get(&k4).and_then(|m| m.get(&'C')),
+                ) {
+                    active_structs.push(ActiveStructure {
+                        name: format!("Condor_{}_{:.3}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f, k4_f),
+                        legs: vec![
+                            (c1_p, 1.0),
+                            (c2_p, -1.0),
+                            (c3_c, -1.0),
+                            (c4_c, 1.0),
+                        ],
+                        expected_fee: 4.0 * fee_per_contract,
+                    });
+                }
+            }
+        }
+    }
+
+    active_structs
+}
+
+/// Structured Multi-Leg Options-Only Portfolio LP Optimizer
+pub fn optimize_portfolio_structured(
+    grid: &OptionGrid,
+    surface: &CalibrationSurface,
+    alpha_scores: &[f64],
+    active_structs: &[ActiveStructure],
+    config: &PortfolioConfig,
+) -> Result<Vec<f64>> {
+    let m = active_structs.len();
+    let n = grid.contracts.len();
+    if m == 0 || n == 0 {
+        return Ok(vec![0.0; m]);
+    }
+    if n != alpha_scores.len() {
+        bail!("Contracts list and alpha scores must have identical size");
+    }
+
+    // Pre-calculate Greeks and Capital Requirements
+    let mut deltas = Vec::with_capacity(n);
+    let mut vegas = Vec::with_capacity(n);
+    let mut thetas = Vec::with_capacity(n);
+    let mut c_long = Vec::with_capacity(n);
+    let mut c_short = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let contract = &grid.contracts[i];
+        let fair_price = surface.evaluate_contract(contract);
+        
+        let gk = calculate_greeks(grid.s_t, contract.strike, contract.tau, surface.r, contract.option_type, fair_price);
+        deltas.push(gk.delta);
+        vegas.push(gk.vega);
+        thetas.push(gk.theta);
+
+        c_long.push(contract.p_a.max(0.0001));
+        c_short.push(contract.p_b + config.margin_ratio * grid.s_t);
+    }
+
+    // Formulate LP variables using good_lp
+    let mut vars = variables!();
+
+    // z^+_p >= 0, z^-_p >= 0
+    let z_plus: Vec<_> = (0..m).map(|_| vars.add(variable().min(0.0).max(config.theta_max))).collect();
+    let z_minus: Vec<_> = (0..m).map(|_| vars.add(variable().min(0.0).max(config.theta_max))).collect();
+
+    // Net expected return for each structure
+    let mut alpha_structs = Vec::with_capacity(m);
+    for p in 0..m {
+        let mut alpha = 0.0;
+        for &(idx, weight) in &active_structs[p].legs {
+            alpha += weight * alpha_scores[idx];
+        }
+        alpha_structs.push(alpha);
+    }
+
+    // Objective function: sum_p (z^+_p - z^-_p) * alpha_struct_p - sum_p (z^+_p + z^-_p) * expected_fee_p
+    // Scaling down expected_fee or standard objective formulation:
+    let mut objective = Expression::from(0.0);
+    for p in 0..m {
+        // expected fee is in CNY, and option premiums are also in CNY. 
+        // 1 contract = 100 units. So we must scale expected fee appropriately to option price terms:
+        // Expected fee in premium points = fee / 100
+        let fee_premium = active_structs[p].expected_fee / 100.0;
+        objective += z_plus[p] * (alpha_structs[p] - fee_premium)
+                   - z_minus[p] * (alpha_structs[p] + fee_premium);
+    }
+
+    let mut problem = vars.maximise(objective).using(default_solver);
+
+    // Compute contract level long/short expressions
+    let mut t_plus_exprs: Vec<Expression> = (0..n).map(|_| Expression::from(0.0)).collect();
+    let mut t_minus_exprs: Vec<Expression> = (0..n).map(|_| Expression::from(0.0)).collect();
+
+    for p in 0..m {
+        for &(idx, w) in &active_structs[p].legs {
+            if w > 0.0 {
+                t_plus_exprs[idx] += z_plus[p] * w;
+                t_minus_exprs[idx] += z_minus[p] * w;
+            } else if w < 0.0 {
+                t_plus_exprs[idx] += z_minus[p] * (-w);
+                t_minus_exprs[idx] += z_plus[p] * (-w);
+            }
+        }
+    }
+
+    // Delta Constraints: -epsilon_delta <= sum_i (Theta^+_i - Theta^-_i)*Delta_i <= epsilon_delta
+    let mut portfolio_delta = Expression::from(0.0);
+    for i in 0..n {
+        portfolio_delta += (t_plus_exprs[i].clone() - t_minus_exprs[i].clone()) * deltas[i];
+    }
+    problem = problem.with(constraint!(portfolio_delta.clone() >= -config.epsilon_delta));
+    problem = problem.with(constraint!(portfolio_delta.clone() <= config.epsilon_delta));
+
+    // Vega Constraints: -epsilon_vega <= sum_i (Theta^+_i - Theta^-_i)*Vega_i <= epsilon_vega
+    let mut portfolio_vega = Expression::from(0.0);
+    for i in 0..n {
+        portfolio_vega += (t_plus_exprs[i].clone() - t_minus_exprs[i].clone()) * vegas[i];
+    }
+    problem = problem.with(constraint!(portfolio_vega.clone() >= -config.epsilon_vega));
+    problem = problem.with(constraint!(portfolio_vega.clone() <= config.epsilon_vega));
+
+    // Theta Constraints: sum_i (Theta^+_i - Theta^-_i)*Theta_i >= -epsilon_theta
+    let mut portfolio_theta = Expression::from(0.0);
+    for i in 0..n {
+        portfolio_theta += (t_plus_exprs[i].clone() - t_minus_exprs[i].clone()) * thetas[i];
+    }
+    problem = problem.with(constraint!(portfolio_theta.clone() >= -config.epsilon_theta));
+
+    // Capital constraints: sum_i (Theta^+_i * c_long_i + Theta^-_i * c_short_i) <= C_max
+    let mut capital_charge = Expression::from(0.0);
+    for i in 0..n {
+        capital_charge += t_plus_exprs[i].clone() * c_long[i] + t_minus_exprs[i].clone() * c_short[i];
+    }
+    problem = problem.with(constraint!(capital_charge <= config.c_max));
+
+    // Solve LP
+    let solution = problem.solve().map_err(|e| anyhow::anyhow!("Structured Portfolio LP failed: {:?}", e))?;
+
+    // Extract target structure weights
+    let mut target_z = Vec::with_capacity(m);
+    for p in 0..m {
+        let val = solution.value(z_plus[p]) - solution.value(z_minus[p]);
+        target_z.push(val);
+    }
+
+    Ok(target_z)
+}
 
 #[derive(Debug, Clone)]
 pub struct PortfolioConfig {
