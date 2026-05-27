@@ -99,7 +99,7 @@ pub fn load_ticks_from_parquet(path: &str, limit: Option<usize>) -> Result<Vec<O
         let moneyness = moneyness_chunked.get(i).unwrap_or(0.0);
         let p_a = pa_chunked.get(i).unwrap_or(0.0);
         let p_b = pb_chunked.get(i).unwrap_or(0.0);
-        let mid = mid_chunked.get(i).unwrap_or(0.0);
+        let mid = mid_chunked.get(i).unwrap_or(f64::NAN);
         let spread = spread_chunked.get(i).unwrap_or(0.0);
         let a_v_eff = av_chunked.get(i).unwrap_or(0);
         let b_v_eff = bv_chunked.get(i).unwrap_or(0);

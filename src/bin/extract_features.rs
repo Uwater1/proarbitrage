@@ -1,4 +1,4 @@
-use proarbitrage::ingestion::{load_ticks_from_parquet, reconstruct_grids, OptionGrid};
+use proarbitrage::ingestion::{load_ticks_from_parquet, reconstruct_grids, OptionGrid, OptionTick};
 use proarbitrage::calibration::calibrate_surface;
 use proarbitrage::activation::{compute_activation_score, extract_candidate_features, ActivationConfig};
 use chrono::NaiveDateTime;
@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{Write, BufWriter};
 use std::time::Instant;
 use std::env;
+use std::collections::HashMap;
 
 fn parse_date(s: &str) -> Option<NaiveDateTime> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.3f") {
@@ -29,69 +30,57 @@ fn parse_date(s: &str) -> Option<NaiveDateTime> {
     None
 }
 
-struct ValidGrid<'a> {
-    index: usize,
-    time: NaiveDateTime,
-    grid: &'a OptionGrid,
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+struct ContractKey {
+    option_type: char,
+    strike_micro: u64,
+    expiry: String,
 }
 
-struct TargetPointer {
-    ptr: usize,
-    target_seconds: i64,
-    tolerance_seconds: i64,
-}
-
-impl TargetPointer {
-    fn new(target_seconds: i64, tolerance_seconds: i64) -> Self {
+impl ContractKey {
+    fn from_tick(tick: &OptionTick) -> Self {
         Self {
-            ptr: 0,
-            target_seconds,
-            tolerance_seconds,
+            option_type: tick.option_type,
+            strike_micro: (tick.strike * 1_000_000.0).round() as u64,
+            expiry: tick.expiry.clone(),
         }
-    }
-
-    fn advance(&mut self, current_time: NaiveDateTime, valid_grids: &[ValidGrid]) -> Option<usize> {
-        let target_time = current_time + chrono::Duration::seconds(self.target_seconds);
-        let start_time = target_time - chrono::Duration::seconds(self.tolerance_seconds);
-        
-        // Move sliding pointer forward to target_time - tolerance
-        while self.ptr < valid_grids.len() && valid_grids[self.ptr].time < start_time {
-            self.ptr += 1;
-        }
-        
-        let mut best_idx = None;
-        let mut min_diff = i64::MAX;
-        let mut scan_ptr = self.ptr;
-        
-        // Look within the tolerance window
-        while scan_ptr < valid_grids.len() {
-            let t = valid_grids[scan_ptr].time;
-            let diff = (t - target_time).num_seconds().abs();
-            if diff <= self.tolerance_seconds {
-                if diff < min_diff {
-                    min_diff = diff;
-                    best_idx = Some(valid_grids[scan_ptr].index);
-                }
-                scan_ptr += 1;
-            } else {
-                break;
-            }
-        }
-        
-        best_idx
     }
 }
 
-fn find_future_mid(grid: &OptionGrid, option_type: char, strike: f64, expiry: &str) -> Option<f64> {
-    for contract in &grid.contracts {
-        if contract.option_type == option_type 
-            && (contract.strike - strike).abs() < 1e-6 
-            && contract.expiry == expiry 
-        {
-            return Some(contract.mid);
+fn find_future_price_hist(
+    price_history: &HashMap<ContractKey, Vec<(NaiveDateTime, f64)>>,
+    key: &ContractKey,
+    target_time: NaiveDateTime,
+    tolerance_seconds: i64,
+) -> Option<f64> {
+    let history = price_history.get(key)?;
+    if history.is_empty() {
+        return None;
+    }
+    
+    // Find index of first element >= target_time
+    let idx = history.partition_point(|x| x.0 < target_time);
+    
+    let mut best_price = None;
+    let mut min_diff = i64::MAX;
+    
+    if idx < history.len() {
+        let diff = (history[idx].0 - target_time).num_seconds().abs();
+        if diff <= tolerance_seconds && diff < min_diff {
+            min_diff = diff;
+            best_price = Some(history[idx].1);
         }
     }
-    None
+    
+    if idx > 0 {
+        let diff = (history[idx - 1].0 - target_time).num_seconds().abs();
+        if diff <= tolerance_seconds && diff < min_diff {
+            min_diff = diff;
+            best_price = Some(history[idx - 1].1);
+        }
+    }
+    
+    best_price
 }
 
 fn main() -> anyhow::Result<()> {
@@ -150,22 +139,22 @@ fn main() -> anyhow::Result<()> {
     let ticks = load_ticks_from_parquet(&input_path, limit)?;
     println!("Loaded {} ticks in {} ms", ticks.len(), start_load.elapsed().as_millis());
 
-    // 2. Reconstruct grids
-    let grids = reconstruct_grids(&ticks);
-    println!("Reconstructed {} chronological grids", grids.len());
-
-    // 3. Pre-parse and filter grids that have valid times
-    let mut valid_grids = Vec::with_capacity(grids.len());
-    for (idx, grid) in grids.iter().enumerate() {
-        if let Some(time) = parse_date(&grid.date) {
-            valid_grids.push(ValidGrid {
-                index: idx,
-                time,
-                grid,
-            });
+    // 2. Build global chronological price history map (using only liquid, non-NaN ticks)
+    let start_hist = Instant::now();
+    let mut price_history: HashMap<ContractKey, Vec<(NaiveDateTime, f64)>> = HashMap::new();
+    for tick in &ticks {
+        if tick.is_liquid && !tick.mid.is_nan() && tick.mid > 0.0 {
+            if let Some(dt) = parse_date(&tick.date) {
+                let key = ContractKey::from_tick(tick);
+                price_history.entry(key).or_default().push((dt, tick.mid));
+            }
         }
     }
-    println!("Found {} valid grids with parsed timestamps.", valid_grids.len());
+    println!("Built history map for {} unique contracts in {} ms", price_history.len(), start_hist.elapsed().as_millis());
+
+    // 3. Reconstruct microsecond-level chronological grids
+    let grids = reconstruct_grids(&ticks);
+    println!("Reconstructed {} chronological timestamp groups", grids.len());
 
     // 4. Open output CSV
     let file = File::create(&output_path)?;
@@ -182,76 +171,97 @@ fn main() -> anyhow::Result<()> {
     let lambda_reg = 0.0001;
     let lambda_gate = 0.0005; // 5 bps
 
-    // Initialize monotonically sliding window pointers
-    let mut pointer_1m = TargetPointer::new(60, 30);
-    let mut pointer_3m = TargetPointer::new(180, 30);
-    let mut pointer_5m = TargetPointer::new(300, 30);
-    let mut pointer_10m = TargetPointer::new(600, 30);
+    // Running cache representing dense state of option surface
+    let mut running_cache: HashMap<ContractKey, OptionTick> = HashMap::new();
 
     let start_extract = Instant::now();
     let mut total_records = 0;
 
-    for (k, vg) in valid_grids.iter().enumerate() {
-        let grid = vg.grid;
+    for (k, grid) in grids.iter().enumerate() {
+        let current_time = match parse_date(&grid.date) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // Update running cache with liquid ticks from this timestamp group
+        for contract in &grid.contracts {
+            if contract.is_liquid && !contract.mid.is_nan() && contract.mid > 0.0 {
+                let key = ContractKey::from_tick(contract);
+                running_cache.insert(key, contract.clone());
+            }
+        }
+
+        // Build dense grid at current spot and time to maturity
+        let mut dense_contracts = Vec::with_capacity(running_cache.len());
+        for cached_tick in running_cache.values() {
+            let mut tick = cached_tick.clone();
+            tick.s_t = grid.s_t; // Update spot to current
+            dense_contracts.push(tick);
+        }
         
-        // Calculate activation score
-        let score = compute_activation_score(grid, &current_surface, &config);
+        let dense_grid = OptionGrid {
+            date: grid.date.clone(),
+            s_t: grid.s_t,
+            contracts: dense_contracts,
+        };
+
+        // Calculate activation score on dense grid state
+        let score = compute_activation_score(&dense_grid, &current_surface, &config);
         let should_calibrate = current_surface.is_none() || score > config.tau_enter;
 
         if should_calibrate {
-            if let Ok(surf) = calibrate_surface(grid, r, lambda_reg) {
+            if let Ok(surf) = calibrate_surface(&dense_grid, r, lambda_reg) {
                 current_surface = Some(surf);
             }
         }
 
+        // Extract features only for contracts that actually updated (ticked) in this group
         if let Some(ref surface) = current_surface {
-            // Find future grid indices using high-speed sliding window
-            let idx_1m = pointer_1m.advance(vg.time, &valid_grids);
-            let idx_3m = pointer_3m.advance(vg.time, &valid_grids);
-            let idx_5m = pointer_5m.advance(vg.time, &valid_grids);
-            let idx_10m = pointer_10m.advance(vg.time, &valid_grids);
-
             for contract in &grid.contracts {
-                if let Some(feat) = extract_candidate_features(contract, surface, lambda_gate) {
-                    // Extract targets
-                    let fut_1m = idx_1m.and_then(|idx| find_future_mid(&grids[idx], contract.option_type, contract.strike, &contract.expiry));
-                    let fut_3m = idx_3m.and_then(|idx| find_future_mid(&grids[idx], contract.option_type, contract.strike, &contract.expiry));
-                    let fut_5m = idx_5m.and_then(|idx| find_future_mid(&grids[idx], contract.option_type, contract.strike, &contract.expiry));
-                    let fut_10m = idx_10m.and_then(|idx| find_future_mid(&grids[idx], contract.option_type, contract.strike, &contract.expiry));
+                if contract.is_liquid && !contract.mid.is_nan() && contract.mid > 0.0 {
+                    if let Some(feat) = extract_candidate_features(contract, surface, lambda_gate) {
+                        let key = ContractKey::from_tick(contract);
 
-                    // Only output if we have at least one valid future target to train on
-                    if fut_1m.is_some() || fut_3m.is_some() || fut_5m.is_some() || fut_10m.is_some() {
-                        let t_1m = fut_1m.map(|f| f - contract.mid).unwrap_or(0.0);
-                        let t_3m = fut_3m.map(|f| f - contract.mid).unwrap_or(0.0);
-                        let t_5m = fut_5m.map(|f| f - contract.mid).unwrap_or(0.0);
-                        let t_10m = fut_10m.map(|f| f - contract.mid).unwrap_or(0.0);
+                        // Look up chronological targets using binary search on history
+                        let fut_1m = find_future_price_hist(&price_history, &key, current_time + chrono::Duration::seconds(60), 30);
+                        let fut_3m = find_future_price_hist(&price_history, &key, current_time + chrono::Duration::seconds(180), 30);
+                        let fut_5m = find_future_price_hist(&price_history, &key, current_time + chrono::Duration::seconds(300), 30);
+                        let fut_10m = find_future_price_hist(&price_history, &key, current_time + chrono::Duration::seconds(600), 30);
 
-                        writeln!(
-                            writer,
-                            "{},{},{:.4},{},{:.5},{:.4},{:.4},{:.5},{:.0},{:.5},{:.5},{:.5},{:.5},{:.5}",
-                            grid.date,
-                            contract.option_type,
-                            contract.strike,
-                            contract.expiry,
-                            feat.immediate_execution_gap,
-                            feat.spot,
-                            feat.moneyness,
-                            feat.tau,
-                            feat.is_put,
-                            feat.spread,
-                            t_1m,
-                            t_3m,
-                            t_5m,
-                            t_10m
-                        )?;
-                        total_records += 1;
+                        // Only output if we have at least one valid future target
+                        if fut_1m.is_some() || fut_3m.is_some() || fut_5m.is_some() || fut_10m.is_some() {
+                            let t_1m = fut_1m.map(|f| f - contract.mid).unwrap_or(0.0);
+                            let t_3m = fut_3m.map(|f| f - contract.mid).unwrap_or(0.0);
+                            let t_5m = fut_5m.map(|f| f - contract.mid).unwrap_or(0.0);
+                            let t_10m = fut_10m.map(|f| f - contract.mid).unwrap_or(0.0);
+
+                            writeln!(
+                                writer,
+                                "{},{},{:.4},{},{:.5},{:.4},{:.4},{:.5},{:.0},{:.5},{:.5},{:.5},{:.5},{:.5}",
+                                grid.date,
+                                contract.option_type,
+                                contract.strike,
+                                contract.expiry,
+                                feat.immediate_execution_gap,
+                                feat.spot,
+                                feat.moneyness,
+                                feat.tau,
+                                feat.is_put,
+                                feat.spread,
+                                t_1m,
+                                t_3m,
+                                t_5m,
+                                t_10m
+                            )?;
+                            total_records += 1;
+                        }
                     }
                 }
             }
         }
 
         if k > 0 && k % 50000 == 0 {
-            println!("Processed {} valid grids, extracted {} records...", k, total_records);
+            println!("Processed {} timestamp groups, extracted {} records...", k, total_records);
         }
     }
 
