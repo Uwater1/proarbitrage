@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@kilocode/cli-windows-x64": "^7.3.1"
+  }
+}

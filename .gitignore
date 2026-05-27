@@ -16,3 +16,13 @@ target
 # Dataset (too huge)
 *_surface.parquet
 *.csv
+
+# Node modules
+node_modules/
+
+# Raw model files (too large)
+models/*.json
+models/*.ubj
+
+# Compressed models are included
+!models_compressed.zip
