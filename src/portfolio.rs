@@ -290,6 +290,38 @@ pub fn optimize_portfolio_structured(
     Ok(target_z)
 }
 
+/// Scans grid for Box, Butterfly, and Iron Condor combinations with high XGBoost expected alpha
+pub fn scan_strict_arbitrage(
+    grid: &OptionGrid,
+    alpha_scores: &[f64],
+    fee_per_contract: f64,
+    profit_threshold: f64,
+) -> Vec<(ActiveStructure, f64, f64)> {
+    let active_structs = generate_active_structures(grid, fee_per_contract);
+    let mut profitable = Vec::new();
+
+    for active_struct in active_structs {
+        let mut expected_alpha = 0.0;
+        for &(idx, weight) in &active_struct.legs {
+            expected_alpha += weight * alpha_scores[idx];
+        }
+
+        let fee_premium = active_struct.expected_fee / 100.0;
+
+        let long_profit = expected_alpha - fee_premium;
+        let short_profit = -expected_alpha - fee_premium;
+
+        if long_profit >= profit_threshold {
+            profitable.push((active_struct, long_profit, 1.0));
+        } else if short_profit >= profit_threshold {
+            profitable.push((active_struct, short_profit, -1.0));
+        }
+    }
+
+    profitable
+}
+
+
 #[derive(Debug, Clone)]
 pub struct PortfolioConfig {
     pub epsilon_delta: f64,

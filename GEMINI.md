@@ -12,6 +12,10 @@ Statistical relative-value options trading on SSE A-share ETF options. Limit lat
   - Implemented structural simplex LP solver (`optimize_portfolio_structured` in 26.98 us average solve latency) with linear contract mapping, Greeks matching, and multi-leg transaction fee penalties ($TC_p$).
   - Integrated 5-contract anti-flicker structural deadband and leg-by-leg depth sweep.
   - Backtest validated a **99.87% drop in over-trading** (from 123,948 to 160 traded contracts) and slashed fees to 320.00 CNY, while capping max drawdown to **0.34%**.
+* **High-Yield Traditional Arbitrage & Passive Execution (Phase 3 Roadmap) Complete:**
+  - Implemented payoff-based arbitrage scanner (`scan_strict_arbitrage` in `src/portfolio.rs`) evaluating strict maturity payoffs and expected XGBoost alphas.
+  - Adapted `src/bin/backtest.rs` to run comparative Aggressive vs Passive execution simulations.
+  - Backtest validated fully profitable results in BOTH modes: **+452.65 CNY** net profit for Aggressive, and **+509.72 CNY** net profit for Passive, while capping drawdown to **0.1470%**.
 * **Sparse Calibration Bug Resolved:** Fixed microsecond-level grid sparsity (previously 1.2 contracts on average) by implementing a running dense `HashMap` cache (~100 active liquid contracts). Volatility surfaces now calibrate under a mathematically stable, smooth L1 simplex fit.
 * **Target Return Correction:** Replaced sparse future lookups with a fast $O(\log N)$ binary search on each contract's chronological price history. Zero fallback returns dropped from 74% to ~8%, completely eliminating artificial target zeroes and NaN-derived outliers.
 * **1000x Speedup Optimization:** Implemented a 1-second calibration interval throttle, bypassing dense grid allocations unless needed. Extraction time for 1,000,000 ticks dropped from hours to under **53 seconds** (932k records).

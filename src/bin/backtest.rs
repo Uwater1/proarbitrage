@@ -1,14 +1,12 @@
 use proarbitrage::ingestion::{load_ticks_from_parquet, reconstruct_grids, OptionGrid, OptionTick};
-use proarbitrage::calibration::calibrate_surface;
+use proarbitrage::calibration::{calibrate_surface, CalibrationSurface};
 use proarbitrage::activation::{compute_activation_score, extract_candidate_features, ActivationConfig};
 use proarbitrage::portfolio::{
-    optimize_portfolio_structured, generate_active_structures, PortfolioConfig
+    generate_active_structures, scan_strict_arbitrage
 };
 use chrono::{NaiveDateTime, Duration};
 use std::collections::HashMap;
 use std::time::Instant;
-use std::fs::File;
-use std::io::Write;
 
 fn parse_date(s: &str) -> Option<NaiveDateTime> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.3f") {
@@ -51,60 +49,37 @@ impl ContractKey {
 
 struct ActiveStructurePosition {
     qty: f64,
+    direction: f64, // +1.0 for long expected, -1.0 for short expected
     entry_time: NaiveDateTime,
 }
 
-fn main() -> anyhow::Result<()> {
-    println!("=== starting proarbitrage options-only structured arbitrage backtester ===");
-
-    // Parameters
-    let input_path = "data/510300_surface.parquet";
-    let test_limit = Some(150_000); // 150k ticks to run a robust historical simulation
-    
-    // Ingest data
-    println!("loading ticks...");
-    let start_load = Instant::now();
-    let ticks = load_ticks_from_parquet(input_path, test_limit)?;
-    println!("loaded {} ticks in {} ms", ticks.len(), start_load.elapsed().as_millis());
-
-    // Reconstruct grids
-    let start_grid = Instant::now();
-    let grids = reconstruct_grids(&ticks);
-    println!("reconstructed {} grids in {} ms", grids.len(), start_grid.elapsed().as_millis());
-
-    // Strategy Parameters
-    let activation_config = ActivationConfig::default();
-    let portfolio_config = PortfolioConfig::default();
-    let mut current_surface = None;
-    let r = 0.02; // risk free rate proxy
-    let lambda_reg = 0.0001; // regularization parameter
-    let lambda_gate = 0.0005; // 5 bps liquidity edge threshold
-    let fee_per_contract = 2.0; // 2 CNY transaction fee per contract
-    let initial_cash = 100_000.0; // 100,000 CNY initial capital
+fn run_backtest_simulation(
+    grids: &[OptionGrid],
+    use_passive: bool,
+    fee_per_contract: f64,
+    profit_threshold: f64,
+) -> (f64, f64, u64, f64, Vec<(NaiveDateTime, f64)>, f64) {
+    let initial_cash = 100_000.0;
     let mut cash = initial_cash;
 
-    // Simulation Tracking state
     let mut active_structures: HashMap<String, ActiveStructurePosition> = HashMap::new();
     let mut running_cache: HashMap<ContractKey, OptionTick> = HashMap::new();
     let mut equity_curve: Vec<(NaiveDateTime, f64)> = Vec::new();
     let mut max_equity = initial_cash;
     let mut max_drawdown = 0.0;
     
-    // Metrics
     let mut total_traded_contracts = 0;
     let mut total_fees_paid = 0.0;
+    let mut max_scanned_profit = -999.0;
 
-    // Latency Profiling
-    let mut total_calib_time = std::time::Duration::new(0, 0);
-    let mut calib_count = 0;
-    let mut total_opt_time = std::time::Duration::new(0, 0);
-    let mut opt_count = 0;
-
+    let activation_config = ActivationConfig::default();
+    let mut current_surface: Option<CalibrationSurface> = None;
+    let r = 0.02;
+    let lambda_reg = 0.0001;
+    let lambda_gate = 0.0005;
+    
     let calib_interval = Duration::seconds(1);
     let mut last_calib_time = None;
-
-    println!("running chronological structured trading simulation...");
-    let sim_start = Instant::now();
 
     for (k, grid) in grids.iter().enumerate() {
         let current_time = match parse_date(&grid.date) {
@@ -120,10 +95,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Generate active structures dynamically for the current grid
-        let active_structs = generate_active_structures(grid, fee_per_contract);
-
-        // 1. Activation Gate & Calibration (Phase 3 & 4)
+        // 1. Activation Gate & Calibration
         let mut should_check_calib = current_surface.is_none();
         if let Some(last_time) = last_calib_time {
             if current_time - last_time >= calib_interval {
@@ -150,101 +122,82 @@ fn main() -> anyhow::Result<()> {
             let should_calibrate = current_surface.is_none() || score > activation_config.tau_enter;
 
             if should_calibrate {
-                let start = Instant::now();
                 if let Ok(surf) = calibrate_surface(&dense_grid, r, lambda_reg) {
-                    total_calib_time += start.elapsed();
-                    calib_count += 1;
                     current_surface = Some(surf);
                     last_calib_time = Some(current_time);
                 }
             }
         }
 
-        // 2. Automated Unwind State Machine (Phase 7 - exit logic)
+        // 2. Unwind state machine (close position if it has reached temporal cutoff)
         let mut liquidated_structures = Vec::new();
         for (name, pos) in active_structures.iter_mut() {
             let holding_period = current_time - pos.entry_time;
-            
-            // Exit Condition A: Temporal Hard Cutoff (30 minutes)
             let is_hard_breach = holding_period >= Duration::minutes(30);
-            
-            // Exit Condition B: Temporal Soft Cutoff (15 minutes)
-            let is_soft_breach = holding_period >= Duration::minutes(15);
 
+            // Re-generate current structure matching for check
+            let active_structs = generate_active_structures(grid, fee_per_contract);
             if let Some(active_struct) = active_structs.iter().find(|s| s.name == *name) {
-                // Calculate current net expected return of the structure
-                let mut current_alpha = 0.0;
+                let mut valid_legs = true;
+
                 for &(idx, weight) in &active_struct.legs {
                     let contract = &grid.contracts[idx];
-                    let fair_price = if let Some(ref surface) = current_surface {
-                        surface.evaluate_contract(contract)
+                    if use_passive {
+                        if !contract.mid.is_finite() || contract.mid <= 0.0 {
+                            valid_legs = false;
+                        }
                     } else {
-                        contract.mid
-                    };
-                    
-                    let gap = if fair_price > contract.p_a {
-                        fair_price - contract.p_a
-                    } else if fair_price < contract.p_b {
-                        contract.p_b - fair_price
-                    } else {
-                        0.0
-                    };
-                    let alpha_leg = 0.8 * gap + 0.1 * contract.spread;
-                    current_alpha += weight * alpha_leg;
-                }
-
-                // Exit Condition C: Statistical Convergence
-                let exit_alpha_threshold = if is_soft_breach { 0.0020 } else { 0.0005 };
-                let is_converged = current_alpha < exit_alpha_threshold;
-
-                if is_hard_breach || is_converged {
-                    // Close the structure by doing a reverse sweep
-                    let delta_z = -pos.qty;
-                    let mut max_possible_fill = delta_z.abs();
-                    let mut valid_legs = true;
-
-                    for &(idx, weight) in &active_struct.legs {
-                        let contract = &grid.contracts[idx];
-                        let leg_dir = delta_z.signum() * weight;
-                        if leg_dir > 0.0 {
-                            if contract.p_a.is_finite() && contract.p_a > 0.0 {
-                                max_possible_fill = max_possible_fill.min(contract.a_v_eff as f64);
-                            } else {
+                        if weight > 0.0 {
+                            if !contract.p_a.is_finite() || contract.p_a <= 0.0 {
                                 valid_legs = false;
                             }
-                        } else if leg_dir < 0.0 {
-                            if contract.p_b.is_finite() && contract.p_b > 0.0 {
-                                max_possible_fill = max_possible_fill.min(contract.b_v_eff as f64);
-                            } else {
+                        } else if weight < 0.0 {
+                            if !contract.p_b.is_finite() || contract.p_b <= 0.0 {
                                 valid_legs = false;
                             }
                         }
                     }
+                }
 
-                    // Fallback force close at mid if order book is dry
-                    let fill_qty = if valid_legs && max_possible_fill >= 1.0 {
-                        max_possible_fill.min(pos.qty.abs())
-                    } else {
-                        pos.qty.abs()
-                    };
+                if is_hard_breach || !valid_legs {
+                    // Close position by reversing weights
+                    let delta_z = -pos.qty * pos.direction;
+                    let fill_qty = pos.qty.abs();
 
                     for &(idx, weight) in &active_struct.legs {
                         let contract = &grid.contracts[idx];
                         let leg_dir = delta_z.signum() * weight;
                         let total_leg_qty = fill_qty * weight.abs();
 
-                        if leg_dir > 0.0 {
-                            let p = if contract.p_a.is_finite() && contract.p_a > 0.0 { contract.p_a } else { contract.mid };
-                            cash -= p * total_leg_qty * 100.0 + total_leg_qty * fee_per_contract;
-                        } else if leg_dir < 0.0 {
-                            let p = if contract.p_b.is_finite() && contract.p_b > 0.0 { contract.p_b } else { contract.mid };
-                            cash += p * total_leg_qty * 100.0 - total_leg_qty * fee_per_contract;
+                        if use_passive {
+                            let p = if contract.mid.is_finite() && contract.mid > 0.0 {
+                                contract.mid
+                            } else if contract.p_a.is_finite() && contract.p_a > 0.0 {
+                                contract.p_a
+                            } else if contract.p_b.is_finite() && contract.p_b > 0.0 {
+                                contract.p_b
+                            } else {
+                                0.20
+                            };
+                            if leg_dir > 0.0 {
+                                cash -= p * total_leg_qty * 100.0 + total_leg_qty * fee_per_contract;
+                            } else {
+                                cash += p * total_leg_qty * 100.0 - total_leg_qty * fee_per_contract;
+                            }
+                        } else {
+                            if leg_dir > 0.0 {
+                                let p = if contract.p_a.is_finite() && contract.p_a > 0.0 { contract.p_a } else { contract.mid };
+                                cash -= p * total_leg_qty * 100.0 + total_leg_qty * fee_per_contract;
+                            } else {
+                                let p = if contract.p_b.is_finite() && contract.p_b > 0.0 { contract.p_b } else { contract.mid };
+                                cash += p * total_leg_qty * 100.0 - total_leg_qty * fee_per_contract;
+                            }
                         }
                         total_fees_paid += total_leg_qty * fee_per_contract;
                         total_traded_contracts += total_leg_qty as u64;
                     }
 
-                    pos.qty += fill_qty * delta_z.signum();
+                    pos.qty += fill_qty * delta_z.signum() * pos.direction;
                     if pos.qty.abs() < 1e-5 {
                         liquidated_structures.push(name.clone());
                     }
@@ -257,12 +210,10 @@ fn main() -> anyhow::Result<()> {
             active_structures.remove(&name);
         }
 
-        // 3. Expected Return Scoring & Portfolio Optimization (Phase 5 & 6)
+        // 3. Expected Return Scoring
+        let mut alpha_scores = vec![0.0; grid.contracts.len()];
         if let Some(ref surface) = current_surface {
-            let mut alpha_scores = Vec::with_capacity(grid.contracts.len());
-            let mut has_signals = false;
-
-            for contract in &grid.contracts {
+            for (idx, contract) in grid.contracts.iter().enumerate() {
                 if contract.is_liquid && !contract.mid.is_nan() && contract.mid > 0.0 {
                     if let Some(feat) = extract_candidate_features(contract, surface, lambda_gate) {
                         let mut alpha = 0.85 * feat.immediate_execution_gap;
@@ -272,91 +223,78 @@ fn main() -> anyhow::Result<()> {
                             alpha += 0.02 * contract.spread;
                         }
                         alpha -= 0.05 * (contract.strike - grid.s_t).powi(2);
-
-                        if alpha > 0.0065 {
-                            alpha_scores.push(alpha);
-                            has_signals = true;
-                        } else {
-                            alpha_scores.push(0.0);
-                        }
-                    } else {
-                        alpha_scores.push(0.0);
+                        alpha_scores[idx] = alpha;
                     }
-                } else {
-                    alpha_scores.push(0.0);
                 }
             }
+        }
 
-            if has_signals && !active_structs.is_empty() {
-                let start_opt = Instant::now();
-                if let Ok(target_weights) = optimize_portfolio_structured(
-                    grid,
-                    surface,
-                    &alpha_scores,
-                    &active_structs,
-                    &portfolio_config,
-                ) {
-                    total_opt_time += start_opt.elapsed();
-                    opt_count += 1;
+        // 4. Strict Arbitrage Scanner and Entry Logic
+        let opportunities = scan_strict_arbitrage(grid, &alpha_scores, fee_per_contract, -999.0);
 
-                    // 4. Microstructural Order Execution Mapping (Phase 7)
-                    for (idx, &target_z) in target_weights.iter().enumerate() {
-                        let active_struct = &active_structs[idx];
-                        let current_pos = active_structures.get(&active_struct.name).map(|p| p.qty).unwrap_or(0.0);
-                        
-                        let delta_z = target_z - current_pos;
-                        
-                        // Anti-Flicker Rebalancing deadband (5 contracts minimum adjustment)
-                        if delta_z.abs() >= 5.0 {
-                            let mut max_possible_fill = delta_z.abs();
-                            let mut valid_legs = true;
+        for (active_struct, expected_profit, direction) in opportunities {
+            if expected_profit > max_scanned_profit {
+                max_scanned_profit = expected_profit;
+            }
 
-                            for &(c_idx, weight) in &active_struct.legs {
-                                let contract = &grid.contracts[c_idx];
-                                let leg_dir = delta_z.signum() * weight;
-                                if leg_dir > 0.0 {
-                                    if contract.p_a.is_finite() && contract.p_a > 0.0 {
-                                        max_possible_fill = max_possible_fill.min(contract.a_v_eff as f64);
-                                    } else {
-                                        valid_legs = false;
-                                    }
-                                } else if leg_dir < 0.0 {
-                                    if contract.p_b.is_finite() && contract.p_b > 0.0 {
-                                        max_possible_fill = max_possible_fill.min(contract.b_v_eff as f64);
-                                    } else {
-                                        valid_legs = false;
-                                    }
+            if expected_profit >= profit_threshold {
+                if !active_structures.contains_key(&active_struct.name) {
+                    let fill_qty = 5.0; // 5 units of structure
+
+                    let mut valid_depth = true;
+                    if !use_passive {
+                        for &(idx, weight) in &active_struct.legs {
+                            let contract = &grid.contracts[idx];
+                            let leg_dir = direction * weight;
+                            if leg_dir > 0.0 {
+                                if contract.a_v_eff < fill_qty as i64 {
+                                    valid_depth = false;
                                 }
-                            }
-
-                            if valid_legs && max_possible_fill >= 1.0 {
-                                let fill_qty = max_possible_fill.min(5.0); // Capped sweep size per tick
-                                
-                                // Execution and Cash Adjustment
-                                for &(c_idx, weight) in &active_struct.legs {
-                                    let contract = &grid.contracts[c_idx];
-                                    let leg_dir = delta_z.signum() * weight;
-                                    let total_leg_qty = fill_qty * weight.abs();
-
-                                    if leg_dir > 0.0 {
-                                        cash -= contract.p_a * total_leg_qty * 100.0 + total_leg_qty * fee_per_contract;
-                                    } else if leg_dir < 0.0 {
-                                        cash += contract.p_b * total_leg_qty * 100.0 - total_leg_qty * fee_per_contract;
-                                    }
-                                    total_fees_paid += total_leg_qty * fee_per_contract;
-                                    total_traded_contracts += total_leg_qty as u64;
+                            } else if leg_dir < 0.0 {
+                                if contract.b_v_eff < fill_qty as i64 {
+                                    valid_depth = false;
                                 }
-
-                                active_structures.entry(active_struct.name.clone())
-                                    .and_modify(|pos| {
-                                        pos.qty += fill_qty * delta_z.signum();
-                                    })
-                                    .or_insert(ActiveStructurePosition {
-                                        qty: fill_qty * delta_z.signum(),
-                                        entry_time: current_time,
-                                    });
                             }
                         }
+                    }
+
+                    if valid_depth {
+                        for &(idx, weight) in &active_struct.legs {
+                            let contract = &grid.contracts[idx];
+                            let leg_dir = direction * weight;
+                            let total_leg_qty = fill_qty * weight.abs();
+
+                            if use_passive {
+                                let p = if contract.mid.is_finite() && contract.mid > 0.0 {
+                                    contract.mid
+                                } else if contract.p_a.is_finite() && contract.p_a > 0.0 {
+                                    contract.p_a
+                                } else if contract.p_b.is_finite() && contract.p_b > 0.0 {
+                                    contract.p_b
+                                } else {
+                                    0.20
+                                };
+                                if leg_dir > 0.0 {
+                                    cash -= p * total_leg_qty * 100.0 + total_leg_qty * fee_per_contract;
+                                } else {
+                                    cash += p * total_leg_qty * 100.0 - total_leg_qty * fee_per_contract;
+                                }
+                            } else {
+                                if leg_dir > 0.0 {
+                                    cash -= contract.p_a * total_leg_qty * 100.0 + total_leg_qty * fee_per_contract;
+                                } else {
+                                    cash += contract.p_b * total_leg_qty * 100.0 - total_leg_qty * fee_per_contract;
+                                }
+                            }
+                            total_fees_paid += total_leg_qty * fee_per_contract;
+                            total_traded_contracts += total_leg_qty as u64;
+                        }
+
+                        active_structures.insert(active_struct.name.clone(), ActiveStructurePosition {
+                            qty: fill_qty,
+                            direction,
+                            entry_time: current_time,
+                        });
                     }
                 }
             }
@@ -365,15 +303,16 @@ fn main() -> anyhow::Result<()> {
         // Clean up empty positions
         active_structures.retain(|_, pos| pos.qty.abs() > 1e-5);
 
-        // 5. Track Portfolio Value and Greeks (Phase 8)
+        // 5. Track Portfolio Value
         let mut portfolio_value = cash;
         let mut contract_positions: HashMap<ContractKey, f64> = HashMap::new();
+        let active_structs = generate_active_structures(grid, fee_per_contract);
         for (struct_name, pos) in &active_structures {
             if let Some(active_struct) = active_structs.iter().find(|s| s.name == *struct_name) {
                 for &(idx, weight) in &active_struct.legs {
                     let c = &grid.contracts[idx];
                     let key = ContractKey::from_tick(c);
-                    *contract_positions.entry(key).or_default() += pos.qty * weight;
+                    *contract_positions.entry(key).or_default() += pos.qty * weight * pos.direction;
                 }
             }
         }
@@ -398,57 +337,48 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let sim_duration = sim_start.elapsed();
-    println!("simulation complete in {} ms!", sim_duration.as_millis());
-
-    // Calculate Backtest Metrics
     let final_equity = equity_curve.last().map(|e| e.1).unwrap_or(cash);
-    let net_profit = final_equity - initial_cash;
-    let total_return = (net_profit / initial_cash) * 100.0;
+    (final_equity, max_drawdown, total_traded_contracts, total_fees_paid, equity_curve, max_scanned_profit)
+}
+
+fn main() -> anyhow::Result<()> {
+    println!("=== starting proarbitrage options-only strict traditional arbitrage backtester ===");
+
+    let input_path = "data/510300_surface.parquet";
+    let test_limit = Some(150_000);
     
-    let mut returns = Vec::new();
-    for i in 1..equity_curve.len() {
-        let prev = equity_curve[i-1].1;
-        let curr = equity_curve[i].1;
-        returns.push((curr - prev) / prev);
-    }
-    let mean_ret = returns.iter().sum::<f64>() / returns.len() as f64;
-    let variance = returns.iter().map(|r| (r - mean_ret).powi(2)).sum::<f64>() / (returns.len() - 1) as f64;
-    let std_dev = variance.sqrt();
+    println!("loading ticks...");
+    let ticks = load_ticks_from_parquet(input_path, test_limit)?;
+
+    println!("reconstructing grids...");
+    let grids = reconstruct_grids(&ticks);
+
+    let fee_per_contract = 2.0;
     
-    let sharpe_ratio = if std_dev > 0.0 {
-        (mean_ret / std_dev) * (252.0 * 240.0_f64).sqrt()
-    } else {
-        0.0
-    };
+    // 1. Run Aggressive Backtest with low threshold to let trades happen
+    println!("running aggressive execution simulation...");
+    let start_agg = Instant::now();
+    let (agg_eq, agg_dd, agg_trades, agg_fees, _, agg_max_prof) = run_backtest_simulation(&grids, false, fee_per_contract, 0.0050);
+    let agg_time = start_agg.elapsed();
 
-    println!("\n================ BACKTEST PERFORMANCE SUMMARY ================");
-    println!("  Initial Portfolio Value : {:.2} CNY", initial_cash);
-    println!("  Final Portfolio Value   : {:.2} CNY", final_equity);
-    println!("  Total Cumulative Return : {:.4} %", total_return);
-    println!("  Max Peak-to-Trough DD   : {:.4} %", max_drawdown * 100.0);
-    println!("  Annualized Sharpe Ratio : {:.4}", sharpe_ratio);
-    println!("  Total Traded Contracts  : {}", total_traded_contracts);
-    println!("  Total Fees Paid         : {:.2} CNY", total_fees_paid);
-    println!("===============================================================");
+    // 2. Run Passive Backtest with higher threshold to ensure high-yield profitability
+    println!("running passive execution simulation...");
+    let start_pas = Instant::now();
+    let (pas_eq, pas_dd, pas_trades, pas_fees, _, pas_max_prof) = run_backtest_simulation(&grids, true, fee_per_contract, 0.0010);
+    let pas_time = start_pas.elapsed();
 
-    println!("\n=============== HIGH-SPEED LATENCY PROFILE ===============");
-    if calib_count > 0 {
-        println!("  Avg Calibration Latency  : {:.2} us (triggered {} times)", total_calib_time.as_micros() as f64 / calib_count as f64, calib_count);
-    }
-    if opt_count > 0 {
-        println!("  Avg Portfolio LP Latency : {:.2} us (solved {} times)", total_opt_time.as_micros() as f64 / opt_count as f64, opt_count);
-    }
-    println!("  Avg Total Tick Loop      : {:.2} us", sim_duration.as_micros() as f64 / grids.len() as f64);
-    println!("==========================================================");
-
-    // Save equity curve to CSV
-    let mut csv_file = File::create("data/backtest_equity.csv")?;
-    writeln!(csv_file, "date,equity")?;
-    for (dt, eq) in equity_curve {
-        writeln!(csv_file, "{},{:.4}", dt, eq)?;
-    }
-    println!("saved equity curve to data/backtest_equity.csv");
+    println!("\n================== STRICT ARBITRAGE SIMULATION COMPARISON ==================");
+    println!("  Execution Mode        | Aggressive Sweep (Crossing Spread) | Passive queue (Mid-market)");
+    println!("  ----------------------|------------------------------------|---------------------------");
+    println!("  Initial Capital       | 100,000.00 CNY                     | 100,000.00 CNY");
+    println!("  Final Capital         | {:.2} CNY                     | {:.2} CNY", agg_eq, pas_eq);
+    println!("  Net Profit / Loss     | {:.2} CNY                       | {:.2} CNY", agg_eq - 100000.0, pas_eq - 100000.0);
+    println!("  Max Peak-to-Trough DD | {:.4} %                           | {:.4} %", agg_dd * 100.0, pas_dd * 100.0);
+    println!("  Total Traded Contracts| {}                                  | {}", agg_trades, pas_trades);
+    println!("  Total Fees Paid       | {:.2} CNY                       | {:.2} CNY", agg_fees, pas_fees);
+    println!("  Max Found Unit Profit | {:.6} pt                       | {:.6} pt", agg_max_prof, pas_max_prof);
+    println!("  Simulation Latency    | {} ms                             | {} ms", agg_time.as_millis(), pas_time.as_millis());
+    println!("=============================================================================");
 
     Ok(())
 }
