@@ -123,7 +123,13 @@ Once training is complete, the script exports the model into multiple formats in
 
 1. **`xgboost_target_5m.ubj`**: XGBoost Universal Binary JSON model. Highly optimized native representation.
 2. **`xgboost_target_5m.json`**: Standard JSON format model.
-3. **`xgboost_target_5m.onnx`**: ONNX format model. Perfect for integration with ONNX Runtime or `candle-onnx` in the low-latency Rust/C++ production trading loops (executing in <100 microseconds).
+ 3. **`xgboost_target_5m.onnx`**: ONNX format model. Perfect for integration with ONNX Runtime or `candle-onnx` in the low-latency Rust/C++ production trading loops (executing in <100 microseconds).
+
+> [!NOTE]
+> **Model Compression for GitHub**: Raw model files are large (>43MB total). A compressed archive `models_compressed.zip` (11.4MB, ~74% compression ratio) is included in the repository. Extract with:
+> ```bash
+> unzip models_compressed.zip
+> ```
 
 ---
 
