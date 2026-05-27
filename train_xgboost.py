@@ -49,7 +49,10 @@ def main():
         return
 
     # Load data
-    df = pd.read_csv(args.input)
+    if args.input.endswith(".parquet"):
+        df = pd.read_parquet(args.input)
+    else:
+        df = pd.read_csv(args.input)
     print(f"Loaded {len(df)} records.")
     
     if len(df) == 0:

@@ -176,6 +176,10 @@ fn main() -> anyhow::Result<()> {
 
     let start_extract = Instant::now();
     let mut total_records = 0;
+    
+    // Throttle calibration to at most once per second to avoid massive heap allocation overhead of caching/cloning
+    let calib_interval = chrono::Duration::seconds(1);
+    let mut last_calib_time = None;
 
     for (k, grid) in grids.iter().enumerate() {
         let current_time = match parse_date(&grid.date) {
@@ -191,27 +195,40 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Build dense grid at current spot and time to maturity
-        let mut dense_contracts = Vec::with_capacity(running_cache.len());
-        for cached_tick in running_cache.values() {
-            let mut tick = cached_tick.clone();
-            tick.s_t = grid.s_t; // Update spot to current
-            dense_contracts.push(tick);
+        // Throttle calibration check to once per second
+        let mut should_check_calib = current_surface.is_none();
+        if let Some(last_time) = last_calib_time {
+            if current_time - last_time >= calib_interval {
+                should_check_calib = true;
+            }
+        } else {
+            should_check_calib = true;
         }
-        
-        let dense_grid = OptionGrid {
-            date: grid.date.clone(),
-            s_t: grid.s_t,
-            contracts: dense_contracts,
-        };
 
-        // Calculate activation score on dense grid state
-        let score = compute_activation_score(&dense_grid, &current_surface, &config);
-        let should_calibrate = current_surface.is_none() || score > config.tau_enter;
+        if should_check_calib {
+            // Build dense grid at current spot and time to maturity
+            let mut dense_contracts = Vec::with_capacity(running_cache.len());
+            for cached_tick in running_cache.values() {
+                let mut tick = cached_tick.clone();
+                tick.s_t = grid.s_t; // Update spot to current
+                dense_contracts.push(tick);
+            }
+            
+            let dense_grid = OptionGrid {
+                date: grid.date.clone(),
+                s_t: grid.s_t,
+                contracts: dense_contracts,
+            };
 
-        if should_calibrate {
-            if let Ok(surf) = calibrate_surface(&dense_grid, r, lambda_reg) {
-                current_surface = Some(surf);
+            // Calculate activation score on dense grid state
+            let score = compute_activation_score(&dense_grid, &current_surface, &config);
+            let should_calibrate = current_surface.is_none() || score > config.tau_enter;
+
+            if should_calibrate {
+                if let Ok(surf) = calibrate_surface(&dense_grid, r, lambda_reg) {
+                    current_surface = Some(surf);
+                    last_calib_time = Some(current_time);
+                }
             }
         }
 
