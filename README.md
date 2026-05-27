@@ -138,3 +138,28 @@ During training, the script outputs key regression metrics:
 * **Root Mean Squared Error (RMSE)**: Direct pricing error in currency units.
 * **$R^2$ (Coefficient of Determination)**: Proportion of variance explained.
 * **Feature Importances**: Ranked listing of structural features driving predictive power (typically led by `immediate_execution_gap` and `spread`).
+
+---
+
+## Phase 8: Chronological Backtester & Friction Insights
+
+To verify the financial and engineering viability of the `strategy_framework.tex` mathematical formulation, the system includes a high-speed chronological tick-by-tick backtesting engine in `src/bin/backtest.rs`.
+
+### Running the Backtester
+To run the chronological trading simulation on the A-share ETF options dataset:
+```bash
+cargo run --release --bin backtest
+```
+
+### Simulation & Latency Benchmarks (150,000 Ticks)
+* **Ingestion Speed**: Ingests and parses 150,000 ticks in **128 ms**.
+* **Grid Reconstruction**: Chronologically groups ticks into 67,954 expiry-strike option grids in **38 ms** (approx. **550 ns** per tick).
+* **Average Calibration Latency**: **6.98 ms** per triggered surface (throttled to at most once per second).
+* **Average Portfolio LP Latency**: **15.31 us** per solve pass.
+* **Average Total Tick Loop Latency**: **120.87 us** per tick group, well within the sub-10ms production target.
+
+### Crucial Financial Insights: The Friction Barrier
+While the Rust engineering pipeline satisfies all low-latency targets, the backtest reveals that the aggressive order routing model is **not profitable** under standard trading frictions:
+* **Over-Trading**: The strategy executed **123,948 contracts** over 67,954 grids due to constant target target weight shifting on micro-ticks.
+* **Fee Erosion**: At 2 CNY exchange fee per contract round-trip, transaction fees alone accrued **247,896 CNY** in negative cash flow, wiping out the surface calibration arbitrage-free edge.
+* **Bid-Ask Spread concession**: Aggressively crossing the spread (buying at Ask, selling at Bid) immediately forfeits the microstructural spread edge.

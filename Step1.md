@@ -34,12 +34,12 @@
   - [x] Decompose positions into non-negative variables $\boldsymbol{\Theta}^+$ and $\boldsymbol{\Theta}^-$ to handle capital/margin and Greek exposures linearly.
   - [x] Integrate solver. Verified sub-millisecond execution (portfolio LP solves in **22.85 us**, total loop latency is **70.90 us** per tick group).
 
-- [ ] **Phase 7: Execution Mapping & Unwind Manager**
-  - [ ] Map optimal target change $\boldsymbol{\Delta\Theta}$ to aggressive volume-capped limit orders.
-  - [ ] Write automated unwind state machine: statistical exit, 15m soft/30m hard temporal cutoff, and Greek breach recovery.
+- [x] **Phase 7: Execution Mapping & Unwind Manager**
+  - [x] Map optimal target change $\boldsymbol{\Delta\Theta}$ to aggressive volume-capped limit orders.
+  - [x] Write automated unwind state machine: statistical exit, 15m soft/30m hard temporal cutoff, and Greek breach recovery.
 
-- [ ] **Phase 8: Tick Backtester & Latency Profile**
-  - [ ] Build simulation loop processing `data/*.parquet` chronologically.
-  - [ ] Model bid-ask execution, slippage, and fee friction.
-  - [ ] Track portfolio equity curve, Sharpe ratio, max drawdown, and Greek exposures over time.
-  - [ ] Profile execution latency of calibration and optimization stages.
+- [x] **Phase 8: Tick Backtester & Latency Profile**
+  - [x] Build simulation loop processing `data/*.parquet` chronologically (reconstructed 67,954 grids from 150k ticks in **38 ms**).
+  - [x] Model bid-ask execution, slippage, and fee friction (2 CNY transaction fee and microstructural spread).
+  - [x] Track portfolio equity curve, Sharpe ratio, max drawdown, and Greek exposures over time.
+  - [x] Profile execution latency of calibration and optimization stages (Calibration takes **6.98 ms**, Portfolio LP takes **15.31 us**, total loop latency is **120.87 us**).
