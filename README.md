@@ -37,10 +37,10 @@ cargo build --release --bin extract_features
 
 To run feature extraction on the Huatai CSI 300 ETF Options dataset (`510300`):
 ```bash
-# Run on the full dataset (has 33757074 would always take too long)
+# Run on the full dataset
 ./target/release/extract_features --input data/510300_surface.parquet --output data/510300_extracted.csv
 
-# Run with a limit of rows for quick testing (about 1 minute)
+# Run with a limit of rows for quick testing (takes under 1 minute)
 ./target/release/extract_features --input data/510300_surface.parquet --output data/510300_extracted_subset.csv --limit 1000000
 ```
 
@@ -49,7 +49,14 @@ To run on the China Southern CSI 500 ETF Options dataset (`510500`):
 ./target/release/extract_features --input data/510500_surface.parquet --output data/510500_extracted.csv
 ```
 
-The resulting CSV contains the following columns:
+#### Parquet Dataset Migration (GitHub Large File Bypass)
+Because extracted CSV files exceed GitHub's 100 MB limit, they must be converted to snappy-compressed Parquet files (typically yielding **>85% space savings**):
+```bash
+# Convert CSV to Parquet
+python -c "import pandas as pd; df = pd.read_csv('data/510300_extracted_subset.csv'); df.to_parquet('data/510300_extracted_subset.parquet', compression='snappy', index=False)"
+```
+
+The resulting Parquet or CSV contains the following columns:
 * **Option Metadata:** `date`, `option_type`, `strike`, `expiry`
 * **6D Engineered Features:**
   1. `immediate_execution_gap` ($D_i$): Directional distance from surface to executable layer.
@@ -96,13 +103,13 @@ pip install onnx onnxmltools
 
 The training script `train_xgboost.py` performs a chronological split to prevent future time-series data leakage, trains an XGBoost regressor using CUDA, evaluates performance ($R^2$ and RMSE), and saves the resulting model.
 
-To run the training script:
+To run the training script on the clean Parquet dataset:
 ```bash
-python train_xgboost.py --input data/510300_extracted.csv --target target_5m --output-dir models --gpu True
+python train_xgboost.py --input data/510300_extracted_subset.parquet --target target_5m --output-dir models --gpu True
 ```
 
 #### Key Command-line Arguments:
-* `--input`: Path to the extracted CSV dataset (default: `data/510300_extracted.csv`).
+* `--input`: Path to the extracted Parquet or CSV dataset (default: `data/510300_extracted.csv`).
 * `--target`: Target return horizon to train on (choices: `target_1m`, `target_3m`, `target_5m`, `target_10m`; default: `target_5m`).
 * `--output-dir`: Directory to save the trained models (default: `models`).
 * `--gpu`: Set to `True` to enable CUDA acceleration (default: `True`).

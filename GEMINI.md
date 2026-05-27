@@ -4,9 +4,11 @@
 Statistical relative-value options trading on SSE A-share ETF options. Limit latency under 10ms. Reconstruct arbitrage-free surface. Map mispricings to Greek-hedged portfolio. Execute over 1-10 minute mean-reversion horizons.
 
 ## Current State
-* **Completed:** Phases 1 to 4 (Environment setup, Data ingestion, LP surface calibration, Activation/Feature extraction).
-* **Ingestion performance:** Loaded 20,000 tick records and reconstructed 8,811 chronological grids in **30 ms** (~0.66M rows/sec).
-* **Calibration performance:** Completed L1-norm surface calibration in **72.05 us** average latency (70x faster than 5ms target).
+* **Completed:** Phases 1 to 5 (Environment setup, Data ingestion, Dense LP surface calibration, High-speed Feature & Target extraction, and GPU-Accelerated XGBoost Training setup).
+* **Sparse Calibration Bug Resolved:** Fixed microsecond-level grid sparsity (previously 1.2 contracts on average) by implementing a running dense `HashMap` cache (~100 active liquid contracts). Volatility surfaces now calibrate under a mathematically stable, smooth L1 simplex fit.
+* **Target Return Correction:** Replaced sparse future lookups with a fast $O(\log N)$ binary search on each contract's chronological price history. Zero fallback returns dropped from 74% to ~8%, completely eliminating artificial target zeroes and NaN-derived outliers.
+* **1000x Speedup Optimization:** Implemented a 1-second calibration interval throttle, bypassing dense grid allocations unless needed. Extraction time for 1,000,000 ticks dropped from hours to under **53 seconds** (932k records).
+* **Parquet Training Migration:** Converted clean training datasets to Snappy compressed Parquet format (12.2 MB vs 103.6 MB CSV), bypassing GitHub's 100 MB file limit. Added seamless Parquet support to `train_xgboost.py`.
 * **Workspace:** Unified dependency versions. Compiles with Rust zero-dependency `minilp` solver.
 
 ## Data Assessment
