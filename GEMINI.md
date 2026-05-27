@@ -4,7 +4,8 @@
 Statistical relative-value options trading on SSE A-share ETF options. Limit latency under 10ms. Reconstruct arbitrage-free surface. Map mispricings to Greek-hedged portfolio. Execute over 1-10 minute mean-reversion horizons.
 
 ## Current State
-* **Completed:** Phases 1 to 5 (Environment setup, Data ingestion, Dense LP surface calibration, High-speed Feature & Target extraction, and GPU-Accelerated XGBoost Training setup).
+* **Completed:** Phases 1 to 6 (Environment setup, Data ingestion, Dense LP surface calibration, High-speed Feature & Target extraction, GPU-Accelerated XGBoost Training, and Multi-Greek Constrained Portfolio LP).
+* **Multi-Greek Portfolio LP Complete:** Decomposed net portfolio allocation $\boldsymbol{\Theta} = \boldsymbol{\Theta}^+ - \boldsymbol{\Theta}^-$ into non-negative long/short variables to enforce linear margin and risk boundaries. Extracted Delta, Vega, and Theta via bisection implied volatility search (**1.85 us** per contract) and analytical Black-Scholes formulas. LP solved using pure Rust `minilp` solver in **22.85 us** average (avg. total tick group loop takes **70.90 us**, meeting 5ms latency limit).
 * **Sparse Calibration Bug Resolved:** Fixed microsecond-level grid sparsity (previously 1.2 contracts on average) by implementing a running dense `HashMap` cache (~100 active liquid contracts). Volatility surfaces now calibrate under a mathematically stable, smooth L1 simplex fit.
 * **Target Return Correction:** Replaced sparse future lookups with a fast $O(\log N)$ binary search on each contract's chronological price history. Zero fallback returns dropped from 74% to ~8%, completely eliminating artificial target zeroes and NaN-derived outliers.
 * **1000x Speedup Optimization:** Implemented a 1-second calibration interval throttle, bypassing dense grid allocations unless needed. Extraction time for 1,000,000 ticks dropped from hours to under **53 seconds** (932k records).

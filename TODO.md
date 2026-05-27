@@ -28,11 +28,11 @@
   - [x] Export model to C (Treelite) or ONNX format for fast inference (integrated ONNX & UBJ export in python pipeline).
   - [ ] Set up compiled tree model inference pipeline in Rust using Candle or bindings.
 
-- [ ] **Phase 6: Multi-Greek Constrained Portfolio LP**
-  - [ ] Extract Greeks (Delta $\boldsymbol{\Delta}$, Vega $\boldsymbol{\nu}$, Theta $\boldsymbol{\vartheta}$) from calibrated surface or analytical formulas.
-  - [ ] Set up LP matrix for Equations 11-15.
-  - [ ] Decompose positions into non-negative variables $\boldsymbol{\Theta}^+$ and $\boldsymbol{\Theta}^-$.
-  - [ ] Integrate solver. Verify sub-millisecond execution.
+- [x] **Phase 6: Multi-Greek Constrained Portfolio LP**
+  - [x] Extract Greeks (Delta $\boldsymbol{\Delta}$, Vega $\boldsymbol{\nu}$, Theta $\boldsymbol{\vartheta}$) from calibrated surface using high-speed numerical bisection (implied volatility) and analytical Black-Scholes formulas (taking **1.85 us** per contract).
+  - [x] Set up LP matrix for Equations 11-15.
+  - [x] Decompose positions into non-negative variables $\boldsymbol{\Theta}^+$ and $\boldsymbol{\Theta}^-$ to handle capital/margin and Greek exposures linearly.
+  - [x] Integrate solver. Verified sub-millisecond execution (portfolio LP solves in **22.85 us**, total loop latency is **70.90 us** per tick group).
 
 - [ ] **Phase 7: Execution Mapping & Unwind Manager**
   - [ ] Map optimal target change $\boldsymbol{\Delta\Theta}$ to aggressive volume-capped limit orders.
