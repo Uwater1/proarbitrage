@@ -18,8 +18,6 @@ target
 *_surface.parquet.bak
 *.csv
 
-# Scratch test files
-scratch/
 
 # Node modules
 node_modules/
