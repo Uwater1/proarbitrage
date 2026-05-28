@@ -4,7 +4,8 @@ use proarbitrage::activation::{
 };
 use proarbitrage::calibration::{calibrate_surface, CalibrationSurface};
 use proarbitrage::ingestion::{load_ticks_from_parquet, reconstruct_grids, OptionGrid, OptionTick};
-use proarbitrage::portfolio::{generate_active_structures, scan_strict_arbitrage};
+use proarbitrage::portfolio::{generate_active_structures, scan_hybrid_arbitrage};
+use proarbitrage::model::XGBModel;
 use std::collections::HashMap;
 use std::time::Instant;
 use std::sync::Arc;
@@ -58,6 +59,7 @@ fn run_backtest_simulation(
     grids: &[OptionGrid],
     fee_per_contract: f64,
     profit_threshold: f64,
+    model: &XGBModel,
 ) -> (f64, f64, u64, f64, Vec<(NaiveDateTime, f64)>, f64) {
     let initial_cash = 100_000.0;
     let mut cash = initial_cash;
@@ -79,6 +81,7 @@ fn run_backtest_simulation(
     let lambda_gate = 0.0005;
 
     let calib_interval = Duration::seconds(5);
+    let mut cached_active_structs: Option<Vec<proarbitrage::portfolio::ActiveStructure>> = None;
     let mut last_check_time = None;
 
     // Timing & event counters
@@ -105,15 +108,43 @@ fn run_backtest_simulation(
 
         let t1 = Instant::now();
         // Update running cache with liquid ticks
+        let mut cache_changed = false;
         for contract in &grid.contracts {
             if contract.is_liquid && !contract.mid.is_nan() && contract.mid > 0.0 {
                 let key = ContractKey::from_tick(contract);
+                if !running_cache.contains_key(&key) {
+                    cache_changed = true;
+                }
                 running_cache.insert(key, contract.clone());
             }
         }
         t_cache_update += t1.elapsed();
 
-        let active_structs = generate_active_structures(grid, fee_per_contract);
+        // Construct dense grid at current spot and time
+        let mut dense_contracts = Vec::with_capacity(running_cache.len());
+        for cached_tick in running_cache.values() {
+            let mut tick = cached_tick.clone();
+            tick.s_t = grid.s_t; // update spot
+            dense_contracts.push(tick);
+        }
+
+        // Sort deterministically to maintain static contract indices
+        dense_contracts.sort_by(|a, b| {
+            let strike_a = (a.strike * 1_000_000.0).round() as u64;
+            let strike_b = (b.strike * 1_000_000.0).round() as u64;
+            (&a.expiry, strike_a, a.option_type).cmp(&(&b.expiry, strike_b, b.option_type))
+        });
+
+        let dense_grid = OptionGrid {
+            date: grid.date.clone(),
+            s_t: grid.s_t,
+            contracts: dense_contracts,
+        };
+
+        if cache_changed || cached_active_structs.is_none() {
+            cached_active_structs = Some(generate_active_structures(&dense_grid, fee_per_contract));
+        }
+        let active_structs = cached_active_structs.as_ref().unwrap();
 
         let t2 = Instant::now();
         let mut should_check_calib = current_surface.is_none();
@@ -128,18 +159,6 @@ fn run_backtest_simulation(
         if should_check_calib {
             num_checks += 1;
             last_check_time = Some(current_time);
-            let mut dense_contracts = Vec::with_capacity(running_cache.len());
-            for cached_tick in running_cache.values() {
-                let mut tick = cached_tick.clone();
-                tick.s_t = grid.s_t; // update spot
-                dense_contracts.push(tick);
-            }
-            let dense_grid = OptionGrid {
-                date: grid.date.clone(),
-                s_t: grid.s_t,
-                contracts: dense_contracts,
-            };
-
             let score = compute_activation_score(&dense_grid, &current_surface, &activation_config);
             let should_calibrate = current_surface.is_none() || score > activation_config.tau_enter;
 
@@ -154,20 +173,21 @@ fn run_backtest_simulation(
         t_calib_gate += t2.elapsed();
 
         let t3 = Instant::now();
-        // 3. Expected Return Scoring (moved up to be available for unwind)
-        let mut alpha_scores = vec![0.0; grid.contracts.len()];
+        // 3. Expected Return Scoring using live XGBoost Inference
+        let mut alpha_scores = vec![0.0; dense_grid.contracts.len()];
         if let Some(ref surface) = current_surface {
-            for (idx, contract) in grid.contracts.iter().enumerate() {
+            for (idx, contract) in dense_grid.contracts.iter().enumerate() {
                 if contract.is_liquid && !contract.mid.is_nan() && contract.mid > 0.0 {
                     if let Some(feat) = extract_candidate_features(contract, surface, lambda_gate) {
-                        let mut alpha = 0.85 * feat.immediate_execution_gap;
-                        if contract.option_type == 'P' {
-                            alpha += 0.12 * contract.spread;
-                        } else {
-                            alpha += 0.02 * contract.spread;
-                        }
-                        alpha -= 0.05 * (contract.strike - grid.s_t).powi(2);
-                        alpha_scores[idx] = alpha;
+                        let features = [
+                            feat.immediate_execution_gap,
+                            feat.spot,
+                            feat.moneyness,
+                            feat.tau,
+                            feat.is_put,
+                            feat.spread,
+                        ];
+                        alpha_scores[idx] = model.predict(&features);
                     }
                 }
             }
@@ -185,7 +205,7 @@ fn run_backtest_simulation(
                 let mut valid_legs = true;
 
                 for &(idx, weight) in &active_struct.legs {
-                    let contract = &grid.contracts[idx];
+                    let contract = &dense_grid.contracts[idx];
                     if weight > 0.0 {
                         if !contract.p_a.is_finite() || contract.p_a <= 0.0 {
                             valid_legs = false;
@@ -199,13 +219,22 @@ fn run_backtest_simulation(
 
                 let mut should_exit = is_hard_breach || !valid_legs;
 
-                // Statistical convergence early exit (reversion threshold at 0.0010 premium points)
+                // Statistical convergence early exit with progressive threshold tightening
                 if !should_exit {
                     let mut current_expected_alpha = 0.0;
                     for &(idx, weight) in &active_struct.legs {
                         current_expected_alpha += weight * alpha_scores[idx];
                     }
-                    if current_expected_alpha * pos.direction <= 0.0010 {
+                    
+                    let holding_minutes = holding_period.num_seconds() as f64 / 60.0;
+                    let exit_threshold = if holding_minutes > 15.0 {
+                        // Tighten threshold progressively from 0.0010 up to 0.0050 at 30 minutes
+                        0.0010 + ((holding_minutes - 15.0) / 15.0) * (0.0050 - 0.0010)
+                    } else {
+                        0.0010
+                    };
+
+                    if current_expected_alpha * pos.direction <= exit_threshold {
                         should_exit = true;
                     }
                 }
@@ -216,7 +245,7 @@ fn run_backtest_simulation(
                     let fill_qty = pos.qty.abs();
 
                     for &(idx, weight) in &active_struct.legs {
-                        let contract = &grid.contracts[idx];
+                        let contract = &dense_grid.contracts[idx];
                         let leg_dir = delta_z.signum() * weight;
                         let total_leg_qty = fill_qty * weight.abs();
 
@@ -226,14 +255,14 @@ fn run_backtest_simulation(
                             } else {
                                 contract.mid
                             };
-                            cash -= p * total_leg_qty * 100.0 + total_leg_qty * fee_per_contract;
+                            cash -= p * total_leg_qty * 10000.0 + total_leg_qty * fee_per_contract;
                         } else {
                             let p = if contract.p_b.is_finite() && contract.p_b > 0.0 {
                                 contract.p_b
                             } else {
                                 contract.mid
                             };
-                            cash += p * total_leg_qty * 100.0 - total_leg_qty * fee_per_contract;
+                            cash += p * total_leg_qty * 10000.0 - total_leg_qty * fee_per_contract;
                         }
                         total_fees_paid += total_leg_qty * fee_per_contract;
                         total_traded_contracts += total_leg_qty as u64;
@@ -254,12 +283,25 @@ fn run_backtest_simulation(
         t_unwind += t4.elapsed();
 
         let t5 = Instant::now();
-        // 4. Strict Arbitrage Scanner and Entry Logic
-        let opportunities = scan_strict_arbitrage(&active_structs, &alpha_scores, -999.0);
+        // 4. Strict Traditional Arbitrage Scanner filtered by XGBoost expected returns
+        let opportunities = scan_hybrid_arbitrage(&dense_grid, &active_structs, &alpha_scores, profit_threshold);
 
         for (active_struct, expected_profit, direction) in opportunities {
             if expected_profit > max_scanned_profit {
                 max_scanned_profit = expected_profit;
+            }
+
+            // Risk Control: stop opening new positions on contracts <= 5 days away from maturity
+            let mut near_maturity = false;
+            for &(idx, _) in &active_struct.legs {
+                let contract = &dense_grid.contracts[idx];
+                if contract.tau * 365.0 <= 5.0 {
+                    near_maturity = true;
+                    break;
+                }
+            }
+            if near_maturity {
+                continue;
             }
 
             if expected_profit >= profit_threshold {
@@ -276,7 +318,7 @@ fn run_backtest_simulation(
                     while fill_qty >= 1.0 {
                         let mut depth_ok = true;
                         for &(idx, weight) in &active_struct.legs {
-                            let contract = &grid.contracts[idx];
+                            let contract = &dense_grid.contracts[idx];
                             let leg_dir = direction * weight;
                             let total_leg_qty = fill_qty * weight.abs();
                             if leg_dir > 0.0 {
@@ -301,7 +343,7 @@ fn run_backtest_simulation(
                     let mut valid_depth = fill_qty >= 1.0;
                     if valid_depth {
                         for &(idx, weight) in &active_struct.legs {
-                            let contract = &grid.contracts[idx];
+                            let contract = &dense_grid.contracts[idx];
                             let leg_dir = direction * weight;
                             let total_leg_qty = fill_qty * weight.abs();
                             if leg_dir > 0.0 {
@@ -318,15 +360,15 @@ fn run_backtest_simulation(
 
                     if valid_depth {
                         for &(idx, weight) in &active_struct.legs {
-                            let contract = &grid.contracts[idx];
+                            let contract = &dense_grid.contracts[idx];
                             let leg_dir = direction * weight;
                             let total_leg_qty = fill_qty * weight.abs();
 
                             if leg_dir > 0.0 {
-                                cash -= contract.p_a * total_leg_qty * 100.0
+                                cash -= contract.p_a * total_leg_qty * 10000.0
                                     + total_leg_qty * fee_per_contract;
                             } else {
-                                cash += contract.p_b * total_leg_qty * 100.0
+                                cash += contract.p_b * total_leg_qty * 10000.0
                                     - total_leg_qty * fee_per_contract;
                             }
                             total_fees_paid += total_leg_qty * fee_per_contract;
@@ -357,7 +399,7 @@ fn run_backtest_simulation(
         for (struct_name, pos) in &active_structures {
             if let Some(active_struct) = active_structs.iter().find(|s| s.name == *struct_name) {
                 for &(idx, weight) in &active_struct.legs {
-                    let c = &grid.contracts[idx];
+                    let c = &dense_grid.contracts[idx];
                     let key = ContractKey::from_tick(c);
                     *contract_positions.entry(key).or_default() += pos.qty * weight * pos.direction;
                 }
@@ -367,7 +409,7 @@ fn run_backtest_simulation(
         for (key, pos_qty) in &contract_positions {
             if let Some(tick) = running_cache.get(key) {
                 if tick.mid.is_finite() && tick.mid > 0.0 {
-                    portfolio_value += pos_qty * tick.mid * 100.0;
+                    portfolio_value += pos_qty * tick.mid * 10000.0;
                 }
             }
         }
@@ -415,8 +457,14 @@ fn run_backtest_simulation(
 fn main() -> anyhow::Result<()> {
     println!("=== starting proarbitrage options-only strict traditional arbitrage backtester ===");
 
-    let input_path = "data/510300_surface.parquet";
-    let test_limit = Some(150_000);
+    // Load native XGBoost model
+    let model_path = "models/xgboost_target_5m.json";
+    println!("loading XGBoost model from {}...", model_path);
+    let model = XGBModel::load_from_json(model_path)?;
+    println!("model loaded successfully (base score: {:.6})", model.base_score);
+
+    let input_path = "data/510300_surface_clean.csv";
+    let test_limit = Some(300_000); // 300,000 ticks for representative statistical backtesting
 
     println!("loading ticks...");
     let ticks = load_ticks_from_parquet(input_path, test_limit)?;
@@ -434,7 +482,7 @@ fn main() -> anyhow::Result<()> {
     println!("running aggressive execution simulation (crossing the spread)...");
     let start_agg = Instant::now();
     let (agg_eq, agg_dd, agg_trades, agg_fees, _, agg_max_prof) =
-        run_backtest_simulation(&grids, fee_per_contract, 0.0050);
+        run_backtest_simulation(&grids, fee_per_contract, 0.0050, &model);
     let agg_time = start_agg.elapsed();
 
     println!(

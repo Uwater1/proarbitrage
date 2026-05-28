@@ -31,13 +31,21 @@ pub struct OptionGrid {
 
 /// Load option ticks from a parquet file using Polars
 pub fn load_ticks_from_parquet(path: &str, limit: Option<usize>) -> Result<Vec<OptionTick>> {
-    let mut df = if let Some(n) = limit {
-        LazyFrame::scan_parquet(path, Default::default())?
-            .limit(n as u32)
-            .collect()?
+    let mut df = if path.ends_with(".csv") {
+        let mut reader = CsvReader::from_path(path)?;
+        if let Some(n) = limit {
+            reader = reader.with_n_rows(Some(n));
+        }
+        reader.finish()?
     } else {
-        LazyFrame::scan_parquet(path, Default::default())?
-            .collect()?
+        if let Some(n) = limit {
+            LazyFrame::scan_parquet(path, Default::default())?
+                .limit(n as u32)
+                .collect()?
+        } else {
+            LazyFrame::scan_parquet(path, Default::default())?
+                .collect()?
+        }
     };
 
     let n_rows = df.height();

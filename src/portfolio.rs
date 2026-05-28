@@ -78,7 +78,7 @@ pub fn generate_active_structures(
             continue;
         }
 
-        // A. Box Arbitrage: strikes K_i < K_j (allow adjacent and 1-strike gap, index difference <= 2)
+        // A. Box Arbitrage: strikes K_i < K_j (allow up to 2-strike index gaps)
         for i in 0..strikes.len() - 1 {
             let limit_j = (i + 3).min(strikes.len());
             for j in (i + 1)..limit_j {
@@ -87,7 +87,7 @@ pub fn generate_active_structures(
                 
                 let k1_f = s1.strike_micro as f64 / 1_000_000.0;
                 let k2_f = s2.strike_micro as f64 / 1_000_000.0;
-
+ 
                 if let (Some(c1_c), Some(c2_c), Some(c1_p), Some(c2_p)) = (
                     s1.call_idx,
                     s2.call_idx,
@@ -107,8 +107,8 @@ pub fn generate_active_structures(
                 }
             }
         }
-
-        // B. Butterfly Spread: equal-interval strikes K_i < K_j < K_k (index limit <= 4 steps)
+ 
+        // B. Butterfly Spread: equal-interval strikes K_i < K_j < K_k
         if strikes.len() >= 3 {
             for i in 0..strikes.len() - 2 {
                 let limit_k = (i + 5).min(strikes.len());
@@ -117,11 +117,11 @@ pub fn generate_active_structures(
                         let s1 = &strikes[i];
                         let s2 = &strikes[j];
                         let s3 = &strikes[k];
-
+ 
                         let k1_f = s1.strike_micro as f64 / 1_000_000.0;
                         let k2_f = s2.strike_micro as f64 / 1_000_000.0;
                         let k3_f = s3.strike_micro as f64 / 1_000_000.0;
-
+ 
                         if (s2.strike_micro - s1.strike_micro) == (s3.strike_micro - s2.strike_micro) {
                             if let (Some(c1), Some(c2), Some(c3)) = (s1.call_idx, s2.call_idx, s3.call_idx) {
                                 active_structs.push(ActiveStructure {
@@ -134,7 +134,7 @@ pub fn generate_active_structures(
                                     expected_fee: 4.0 * fee_per_contract,
                                 });
                             }
-
+ 
                             if let (Some(p1), Some(p2), Some(p3)) = (s1.put_idx, s2.put_idx, s3.put_idx) {
                                 active_structs.push(ActiveStructure {
                                     name: format!("P_Fly_{}_{:.3}_{:.3}_{:.3}", expiry, k1_f, k2_f, k3_f),
@@ -151,8 +151,8 @@ pub fn generate_active_structures(
                 }
             }
         }
-
-        // C. Iron Condor: strikes K_i < K_j < K_k < K_l (index limit <= 5 steps)
+ 
+        // C. Iron Condor: strikes K_i < K_j < K_k < K_l
         if strikes.len() >= 4 {
             for i in 0..strikes.len() - 3 {
                 let limit_l = (i + 6).min(strikes.len());
@@ -351,6 +351,123 @@ pub fn scan_strict_arbitrage(
 
     profitable
 }
+
+/// Scans options-only structures for risk-locked traditional arbitrage (maturity payout > cost)
+/// then filters for the most profitable ones based on XGBoost statistical expected returns.
+pub fn scan_hybrid_arbitrage(
+    grid: &OptionGrid,
+    active_structs: &[ActiveStructure],
+    alpha_scores: &[f64],
+    profit_threshold: f64,
+) -> Vec<(ActiveStructure, f64, f64)> {
+    let mut profitable = Vec::new();
+
+
+
+    for active_struct in active_structs {
+        // Collect unique strikes in sorted order using stack allocation (no heap allocation!)
+        let mut strikes_arr = [0.0; 4];
+        let mut strikes_len = 0;
+        for &(idx, _) in &active_struct.legs {
+            let strike = grid.contracts[idx].strike;
+            let mut found = false;
+            for i in 0..strikes_len {
+                if (strikes_arr[i] - strike).abs() < 1e-5 {
+                    found = true;
+                    break;
+                }
+            }
+            if !found && strikes_len < 4 {
+                let mut pos = strikes_len;
+                while pos > 0 && strikes_arr[pos - 1] > strike {
+                    strikes_arr[pos] = strikes_arr[pos - 1];
+                    pos -= 1;
+                }
+                strikes_arr[pos] = strike;
+                strikes_len += 1;
+            }
+        }
+
+        // Symmetrically evaluate both long (+1.0) and short (-1.0) execution directions
+        for &direction in &[1.0, -1.0] {
+            let mut cost = 0.0;
+            let mut has_nan = false;
+            for &(idx, weight) in &active_struct.legs {
+                let contract = &grid.contracts[idx];
+                let leg_dir = direction * weight;
+                if leg_dir > 0.0 {
+                    if contract.p_a.is_nan() || contract.p_a <= 0.0 {
+                        has_nan = true;
+                        break;
+                    }
+                    cost += contract.p_a * leg_dir.abs();
+                } else if leg_dir < 0.0 {
+                    if contract.p_b.is_nan() || contract.p_b <= 0.0 {
+                        has_nan = true;
+                        break;
+                    }
+                    cost -= contract.p_b * leg_dir.abs();
+                }
+            }
+            if has_nan {
+                continue;
+            }
+            cost += active_struct.expected_fee / 10000.0; // Fixed: options contract size multiplier in China is 10,000
+
+            // Compute the guaranteed maturity profit
+            let mut guaranteed_profit = -999.0;
+            if active_struct.name.starts_with("Box_") {
+                if strikes_len == 2 {
+                    let k1 = strikes_arr[0];
+                    let k2 = strikes_arr[1];
+                    let width = k2 - k1;
+                    if direction > 0.0 {
+                        guaranteed_profit = width - cost;
+                    } else {
+                        guaranteed_profit = -width - cost;
+                    }
+                }
+            } else if active_struct.name.starts_with("C_Fly_") || active_struct.name.starts_with("P_Fly_") {
+                if direction > 0.0 {
+                    guaranteed_profit = -cost; // minimum butterfly payoff is 0
+                }
+            } else if active_struct.name.starts_with("Condor_") {
+                if strikes_len == 4 {
+                    let k1 = strikes_arr[0];
+                    let k2 = strikes_arr[1];
+                    let k3 = strikes_arr[2];
+                    let k4 = strikes_arr[3];
+                    let max_loss = (k2 - k1).max(k4 - k3);
+                    if direction > 0.0 {
+                        guaranteed_profit = -cost - max_loss;
+                    } else {
+                        guaranteed_profit = -cost; // minimum short condor payoff is 0
+                    }
+                }
+            }
+
+
+
+            // Must have positive risk-free payout at maturity (payout > entry cost)
+            if guaranteed_profit > 0.0001 {
+                // Compute expected statistical alpha score from XGBoost
+                let mut expected_alpha = 0.0;
+                for &(idx, weight) in &active_struct.legs {
+                    expected_alpha += weight * alpha_scores[idx];
+                }
+                
+                let expected_profit = direction * expected_alpha - active_struct.expected_fee / 10000.0;
+
+                if expected_profit >= profit_threshold {
+                    profitable.push((active_struct.clone(), expected_profit, direction));
+                }
+            }
+        }
+    }
+
+    profitable
+}
+
 
 
 #[derive(Debug, Clone)]
