@@ -25,6 +25,8 @@ pub struct ActiveStructure {
     pub name: String,
     pub legs: Vec<(usize, f64)>, // (contract_index, weight)
     pub expected_fee: f64,
+    pub struct_type: u8,         // 1: Box, 2: Butterfly, 3: Condor
+    pub param1: f64,             // static parameter (e.g. width/max_loss)
 }
 
 struct StrikeInfo {
@@ -103,6 +105,8 @@ pub fn generate_active_structures(
                             (c1_p, -1.0),
                         ],
                         expected_fee: 4.0 * fee_per_contract,
+                        struct_type: 1,
+                        param1: k2_f - k1_f,
                     });
                 }
             }
@@ -132,6 +136,8 @@ pub fn generate_active_structures(
                                         (c3, 1.0),
                                     ],
                                     expected_fee: 4.0 * fee_per_contract,
+                                    struct_type: 2,
+                                    param1: 0.0,
                                 });
                             }
  
@@ -144,6 +150,8 @@ pub fn generate_active_structures(
                                         (p3, 1.0),
                                     ],
                                     expected_fee: 4.0 * fee_per_contract,
+                                    struct_type: 2,
+                                    param1: 0.0,
                                 });
                             }
                         }
@@ -184,6 +192,8 @@ pub fn generate_active_structures(
                                         (c4, 1.0),
                                     ],
                                     expected_fee: 4.0 * fee_per_contract,
+                                    struct_type: 3,
+                                    param1: (k2_f - k1_f).max(k4_f - k3_f),
                                 });
                             }
                         }
@@ -362,32 +372,7 @@ pub fn scan_hybrid_arbitrage(
 ) -> Vec<(ActiveStructure, f64, f64)> {
     let mut profitable = Vec::new();
 
-
-
     for active_struct in active_structs {
-        // Collect unique strikes in sorted order using stack allocation (no heap allocation!)
-        let mut strikes_arr = [0.0; 4];
-        let mut strikes_len = 0;
-        for &(idx, _) in &active_struct.legs {
-            let strike = grid.contracts[idx].strike;
-            let mut found = false;
-            for i in 0..strikes_len {
-                if (strikes_arr[i] - strike).abs() < 1e-5 {
-                    found = true;
-                    break;
-                }
-            }
-            if !found && strikes_len < 4 {
-                let mut pos = strikes_len;
-                while pos > 0 && strikes_arr[pos - 1] > strike {
-                    strikes_arr[pos] = strikes_arr[pos - 1];
-                    pos -= 1;
-                }
-                strikes_arr[pos] = strike;
-                strikes_len += 1;
-            }
-        }
-
         // Symmetrically evaluate both long (+1.0) and short (-1.0) execution directions
         for &direction in &[1.0, -1.0] {
             let mut cost = 0.0;
@@ -416,37 +401,30 @@ pub fn scan_hybrid_arbitrage(
 
             // Compute the guaranteed maturity profit
             let mut guaranteed_profit = -999.0;
-            if active_struct.name.starts_with("Box_") {
-                if strikes_len == 2 {
-                    let k1 = strikes_arr[0];
-                    let k2 = strikes_arr[1];
-                    let width = k2 - k1;
+            match active_struct.struct_type {
+                1 => { // Box
+                    let width = active_struct.param1;
                     if direction > 0.0 {
                         guaranteed_profit = width - cost;
                     } else {
                         guaranteed_profit = -width - cost;
                     }
                 }
-            } else if active_struct.name.starts_with("C_Fly_") || active_struct.name.starts_with("P_Fly_") {
-                if direction > 0.0 {
-                    guaranteed_profit = -cost; // minimum butterfly payoff is 0
+                2 => { // Butterfly
+                    if direction > 0.0 {
+                        guaranteed_profit = -cost; // minimum butterfly payoff is 0
+                    }
                 }
-            } else if active_struct.name.starts_with("Condor_") {
-                if strikes_len == 4 {
-                    let k1 = strikes_arr[0];
-                    let k2 = strikes_arr[1];
-                    let k3 = strikes_arr[2];
-                    let k4 = strikes_arr[3];
-                    let max_loss = (k2 - k1).max(k4 - k3);
+                3 => { // Condor
+                    let max_loss = active_struct.param1;
                     if direction > 0.0 {
                         guaranteed_profit = -cost - max_loss;
                     } else {
                         guaranteed_profit = -cost; // minimum short condor payoff is 0
                     }
                 }
+                _ => {}
             }
-
-
 
             // Must have positive risk-free payout at maturity (payout > entry cost)
             if guaranteed_profit > 0.0001 {

@@ -101,8 +101,24 @@ pub fn load_ticks_from_parquet(path: &str, limit: Option<usize>) -> Result<Vec<O
     let mut last_date_str = String::new();
     let mut last_date_arc: Arc<str> = Arc::from("");
 
-    for i in 0..n_rows {
-        let date_str = date_chunked.get(i).unwrap_or("");
+    let mut date_iter = date_chunked.iter();
+    let mut type_iter = type_chunked.iter();
+    let mut strike_iter = strike_chunked.iter();
+    let mut expiry_iter = expiry_chunked.iter();
+    let mut days_iter = days_chunked.iter();
+    let mut tau_iter = tau_chunked.iter();
+    let mut st_iter = st_chunked.iter();
+    let mut moneyness_iter = moneyness_chunked.iter();
+    let mut pa_iter = pa_chunked.iter();
+    let mut pb_iter = pb_chunked.iter();
+    let mut mid_iter = mid_chunked.iter();
+    let mut spread_iter = spread_chunked.iter();
+    let mut av_iter = av_chunked.iter();
+    let mut bv_iter = bv_chunked.iter();
+    let mut liquid_iter = liquid_chunked.iter();
+
+    for _ in 0..n_rows {
+        let date_str = date_iter.next().flatten().unwrap_or("");
         let date = if date_str == last_date_str {
             last_date_arc.clone()
         } else {
@@ -111,26 +127,26 @@ pub fn load_ticks_from_parquet(path: &str, limit: Option<usize>) -> Result<Vec<O
             last_date_arc.clone()
         };
 
-        let opt_type_str = type_chunked.get(i).unwrap_or("C");
+        let opt_type_str = type_iter.next().flatten().unwrap_or("C");
         let option_type = opt_type_str.chars().next().unwrap_or('C');
-        let strike = strike_chunked.get(i).unwrap_or(0.0);
+        let strike = strike_iter.next().flatten().unwrap_or(0.0);
 
-        let expiry_str = expiry_chunked.get(i).unwrap_or("");
+        let expiry_str = expiry_iter.next().flatten().unwrap_or("");
         let expiry = expiry_cache.entry(expiry_str.to_string())
             .or_insert_with(|| Arc::from(expiry_str))
             .clone();
 
-        let days_to_maturity = days_chunked.get(i).unwrap_or(0.0);
-        let tau = tau_chunked.get(i).unwrap_or(0.0);
-        let s_t = st_chunked.get(i).unwrap_or(0.0);
-        let moneyness = moneyness_chunked.get(i).unwrap_or(0.0);
-        let p_a = pa_chunked.get(i).unwrap_or(0.0);
-        let p_b = pb_chunked.get(i).unwrap_or(0.0);
-        let mid = mid_chunked.get(i).unwrap_or(f64::NAN);
-        let spread = spread_chunked.get(i).unwrap_or(0.0);
-        let a_v_eff = av_chunked.get(i).unwrap_or(0);
-        let b_v_eff = bv_chunked.get(i).unwrap_or(0);
-        let is_liquid = liquid_chunked.get(i).unwrap_or(false);
+        let days_to_maturity = days_iter.next().flatten().unwrap_or(0.0);
+        let tau = tau_iter.next().flatten().unwrap_or(0.0);
+        let s_t = st_iter.next().flatten().unwrap_or(0.0);
+        let moneyness = moneyness_iter.next().flatten().unwrap_or(0.0);
+        let p_a = pa_iter.next().flatten().unwrap_or(0.0);
+        let p_b = pb_iter.next().flatten().unwrap_or(0.0);
+        let mid = mid_iter.next().flatten().unwrap_or(f64::NAN);
+        let spread = spread_iter.next().flatten().unwrap_or(0.0);
+        let a_v_eff = av_iter.next().flatten().unwrap_or(0);
+        let b_v_eff = bv_iter.next().flatten().unwrap_or(0);
+        let is_liquid = liquid_iter.next().flatten().unwrap_or(false);
 
         ticks.push(OptionTick {
             date,

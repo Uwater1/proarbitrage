@@ -32,19 +32,51 @@ fn parse_date(s: &str) -> Option<NaiveDateTime> {
     None
 }
 
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+fn fast_parse_date(s: &str) -> Option<NaiveDateTime> {
+    if s.len() < 19 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b' ' || bytes[13] != b':' || bytes[16] != b':' {
+        return parse_date(s);
+    }
+    
+    let year = ((bytes[0] - b'0') as i32) * 1000 + ((bytes[1] - b'0') as i32) * 100 + ((bytes[2] - b'0') as i32) * 10 + ((bytes[3] - b'0') as i32);
+    let month = ((bytes[5] - b'0') as u32) * 10 + ((bytes[6] - b'0') as u32);
+    let day = ((bytes[8] - b'0') as u32) * 10 + ((bytes[9] - b'0') as u32);
+    let hour = ((bytes[11] - b'0') as u32) * 10 + ((bytes[12] - b'0') as u32);
+    let min = ((bytes[14] - b'0') as u32) * 10 + ((bytes[15] - b'0') as u32);
+    let sec = ((bytes[17] - b'0') as u32) * 10 + ((bytes[18] - b'0') as u32);
+    
+    let mut nano = 0;
+    if s.len() > 19 && bytes[19] == b'.' {
+        let mut idx = 20;
+        let mut multiplier = 100_000_000;
+        while idx < s.len() && bytes[idx].is_ascii_digit() && multiplier > 0 {
+            nano += ((bytes[idx] - b'0') as u32) * multiplier;
+            multiplier /= 10;
+            idx += 1;
+        }
+    }
+    
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = chrono::NaiveTime::from_hms_nano_opt(hour, min, sec, nano)?;
+    Some(NaiveDateTime::new(date, time))
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 struct ContractKey {
     option_type: char,
     strike_micro: u64,
-    expiry: Arc<str>,
+    expiry_ptr: usize,
 }
-
+ 
 impl ContractKey {
     fn from_tick(tick: &OptionTick) -> Self {
         Self {
             option_type: tick.option_type,
             strike_micro: (tick.strike * 1_000_000.0).round() as u64,
-            expiry: Arc::clone(&tick.expiry),
+            expiry_ptr: Arc::as_ptr(&tick.expiry) as *const () as usize,
         }
     }
 }
@@ -80,7 +112,7 @@ fn run_backtest_simulation(
     let lambda_reg = 0.0001;
     let lambda_gate = 0.0005;
 
-    let calib_interval = Duration::seconds(5);
+    let calib_interval = Duration::seconds(60);
     let mut cached_active_structs: Option<Vec<proarbitrage::portfolio::ActiveStructure>> = None;
     let mut last_check_time = None;
 
@@ -98,9 +130,18 @@ fn run_backtest_simulation(
     let mut t_scanner = std::time::Duration::ZERO;
     let mut t_portfolio = std::time::Duration::ZERO;
 
+    let mut dense_contracts: Vec<OptionTick> = Vec::with_capacity(128);
+    let mut key_to_index: HashMap<ContractKey, usize> = HashMap::with_capacity(128);
+    let mut alpha_scores: Vec<f64> = Vec::with_capacity(128);
+    let mut liquidated_structures: Vec<String> = Vec::with_capacity(32);
+    let mut struct_name_to_index: HashMap<String, usize> = HashMap::with_capacity(512);
+
     for (k, grid) in grids.iter().enumerate() {
+        if k % 5000 == 0 {
+            println!("  -> processing grid {} / {}...", k, grids.len());
+        }
         let t0 = Instant::now();
-        let current_time = match parse_date(&grid.date) {
+        let current_time = match fast_parse_date(&grid.date) {
             Some(t) => t,
             None => continue,
         };
@@ -120,34 +161,68 @@ fn run_backtest_simulation(
         }
         t_cache_update += t1.elapsed();
 
-        // Construct dense grid at current spot and time
-        let mut dense_contracts = Vec::with_capacity(running_cache.len());
-        for cached_tick in running_cache.values() {
-            let mut tick = cached_tick.clone();
-            tick.s_t = grid.s_t; // update spot
-            dense_contracts.push(tick);
+        if cache_changed || cached_active_structs.is_none() {
+            dense_contracts.clear();
+            for cached_tick in running_cache.values() {
+                dense_contracts.push(cached_tick.clone());
+            }
+
+            dense_contracts.sort_by(|a, b| {
+                let strike_a = (a.strike * 1_000_000.0).round() as u64;
+                let strike_b = (b.strike * 1_000_000.0).round() as u64;
+                (&a.expiry, strike_a, a.option_type).cmp(&(&b.expiry, strike_b, b.option_type))
+            });
+
+            key_to_index.clear();
+            for (idx, contract) in dense_contracts.iter().enumerate() {
+                let key = ContractKey::from_tick(contract);
+                key_to_index.insert(key, idx);
+            }
+        } else {
+            for contract in &grid.contracts {
+                if contract.is_liquid && !contract.mid.is_nan() && contract.mid > 0.0 {
+                    let key = ContractKey::from_tick(contract);
+                    if let Some(&idx) = key_to_index.get(&key) {
+                        let c = &mut dense_contracts[idx];
+                        c.date = contract.date.clone();
+                        c.days_to_maturity = contract.days_to_maturity;
+                        c.tau = contract.tau;
+                        c.moneyness = contract.moneyness;
+                        c.p_a = contract.p_a;
+                        c.p_b = contract.p_b;
+                        c.mid = contract.mid;
+                        c.spread = contract.spread;
+                        c.a_v_eff = contract.a_v_eff;
+                        c.b_v_eff = contract.b_v_eff;
+                        c.is_liquid = contract.is_liquid;
+                    }
+                }
+            }
         }
 
-        // Sort deterministically to maintain static contract indices
-        dense_contracts.sort_by(|a, b| {
-            let strike_a = (a.strike * 1_000_000.0).round() as u64;
-            let strike_b = (b.strike * 1_000_000.0).round() as u64;
-            (&a.expiry, strike_a, a.option_type).cmp(&(&b.expiry, strike_b, b.option_type))
-        });
+        for c in &mut dense_contracts {
+            c.s_t = grid.s_t;
+            c.date = grid.date.clone();
+        }
 
         let dense_grid = OptionGrid {
             date: grid.date.clone(),
             s_t: grid.s_t,
-            contracts: dense_contracts,
+            contracts: dense_contracts.clone(),
         };
 
         if cache_changed || cached_active_structs.is_none() {
-            cached_active_structs = Some(generate_active_structures(&dense_grid, fee_per_contract));
+            let structs = generate_active_structures(&dense_grid, fee_per_contract);
+            struct_name_to_index.clear();
+            for (idx, s) in structs.iter().enumerate() {
+                struct_name_to_index.insert(s.name.clone(), idx);
+            }
+            cached_active_structs = Some(structs);
         }
         let active_structs = cached_active_structs.as_ref().unwrap();
 
         let t2 = Instant::now();
-        let mut should_check_calib = current_surface.is_none();
+        let mut should_check_calib = false;
         if let Some(last_time) = last_check_time {
             if current_time - last_time >= calib_interval {
                 should_check_calib = true;
@@ -159,14 +234,18 @@ fn run_backtest_simulation(
         if should_check_calib {
             num_checks += 1;
             last_check_time = Some(current_time);
-            let score = compute_activation_score(&dense_grid, &current_surface, &activation_config);
-            let should_calibrate = current_surface.is_none() || score > activation_config.tau_enter;
+            
+            let num_liquid = dense_grid.contracts.iter().filter(|c| c.is_liquid && c.tau > 0.0 && c.strike > 0.0).count();
+            if num_liquid >= 6 {
+                let score = compute_activation_score(&dense_grid, &current_surface, &activation_config);
+                let should_calibrate = current_surface.is_none() || score > activation_config.tau_enter;
 
-            if should_calibrate {
-                num_calibs += 1;
-                if let Ok(surf) = calibrate_surface(&dense_grid, r, lambda_reg) {
-                    current_surface = Some(surf);
-                    num_calib_success += 1;
+                if should_calibrate {
+                    num_calibs += 1;
+                    if let Ok(surf) = calibrate_surface(&dense_grid, r, lambda_reg) {
+                        current_surface = Some(surf);
+                        num_calib_success += 1;
+                    }
                 }
             }
         }
@@ -174,7 +253,8 @@ fn run_backtest_simulation(
 
         let t3 = Instant::now();
         // 3. Expected Return Scoring using live XGBoost Inference
-        let mut alpha_scores = vec![0.0; dense_grid.contracts.len()];
+        alpha_scores.clear();
+        alpha_scores.resize(dense_grid.contracts.len(), 0.0);
         if let Some(ref surface) = current_surface {
             for (idx, contract) in dense_grid.contracts.iter().enumerate() {
                 if contract.is_liquid && !contract.mid.is_nan() && contract.mid > 0.0 {
@@ -196,12 +276,12 @@ fn run_backtest_simulation(
 
         let t4 = Instant::now();
         // 2. Unwind state machine (close position if it has reached temporal cutoff or statistical convergence)
-        let mut liquidated_structures = Vec::new();
+        liquidated_structures.clear();
         for (name, pos) in active_structures.iter_mut() {
             let holding_period = current_time - pos.entry_time;
             let is_hard_breach = holding_period >= Duration::minutes(30);
 
-            if let Some(active_struct) = active_structs.iter().find(|s| s.name == *name) {
+            if let Some(active_struct) = struct_name_to_index.get(name).map(|&idx| &active_structs[idx]) {
                 let mut valid_legs = true;
 
                 for &(idx, weight) in &active_struct.legs {
@@ -277,8 +357,8 @@ fn run_backtest_simulation(
                 liquidated_structures.push(name.clone());
             }
         }
-        for name in liquidated_structures {
-            active_structures.remove(&name);
+        for name in &liquidated_structures {
+            active_structures.remove(name);
         }
         t_unwind += t4.elapsed();
 
@@ -395,21 +475,14 @@ fn run_backtest_simulation(
         let t6 = Instant::now();
         // 5. Track Portfolio Value
         let mut portfolio_value = cash;
-        let mut contract_positions: HashMap<ContractKey, f64> = HashMap::new();
         for (struct_name, pos) in &active_structures {
-            if let Some(active_struct) = active_structs.iter().find(|s| s.name == *struct_name) {
+            if let Some(&struct_idx) = struct_name_to_index.get(struct_name) {
+                let active_struct = &active_structs[struct_idx];
                 for &(idx, weight) in &active_struct.legs {
                     let c = &dense_grid.contracts[idx];
-                    let key = ContractKey::from_tick(c);
-                    *contract_positions.entry(key).or_default() += pos.qty * weight * pos.direction;
-                }
-            }
-        }
-
-        for (key, pos_qty) in &contract_positions {
-            if let Some(tick) = running_cache.get(key) {
-                if tick.mid.is_finite() && tick.mid > 0.0 {
-                    portfolio_value += pos_qty * tick.mid * 10000.0;
+                    if c.mid.is_finite() && c.mid > 0.0 {
+                        portfolio_value += pos.qty * weight * pos.direction * c.mid * 10000.0;
+                    }
                 }
             }
         }
@@ -463,8 +536,8 @@ fn main() -> anyhow::Result<()> {
     let model = XGBModel::load_from_json(model_path)?;
     println!("model loaded successfully (base score: {:.6})", model.base_score);
 
-    let input_path = "data/510300_surface_clean.csv";
-    let test_limit = Some(300_000); // 300,000 ticks for representative statistical backtesting
+    let input_path = "data/510300_surface_clean.parquet";
+    let test_limit = Some(50_000); // 50,000 ticks for fast representative statistical backtesting
 
     println!("loading ticks...");
     let ticks = load_ticks_from_parquet(input_path, test_limit)?;

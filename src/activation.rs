@@ -1,7 +1,6 @@
 use crate::ingestion::{OptionGrid, OptionTick};
 use crate::calibration::CalibrationSurface;
-use std::collections::HashMap;
-use std::sync::Arc;
+
 
 #[derive(Debug, Clone)]
 pub struct ActivationConfig {
@@ -31,62 +30,60 @@ impl Default for ActivationConfig {
 /// Calculate shape violation score L_t on option mid-prices
 pub fn compute_shape_violations(grid: &OptionGrid) -> f64 {
     let mut total_violation = 0.0;
-
-    // Group contracts by expiry to check strike monotonicity and convexity
-    let mut by_expiry: HashMap<Arc<str>, Vec<&OptionTick>> = HashMap::new();
-    for contract in &grid.contracts {
-        if contract.is_liquid {
-            by_expiry.entry(contract.expiry.clone()).or_default().push(contract);
-        }
+    if grid.contracts.is_empty() {
+        return total_violation;
     }
 
-    for (_, mut contracts) in by_expiry {
-        // Sort by strike price
-        contracts.sort_by(|a, b| a.strike.partial_cmp(&b.strike).unwrap());
-        let m = contracts.len();
-        if m < 2 {
-            continue;
+    // Since grid.contracts is already sorted by (expiry, strike, option_type),
+    // we can process it in linear time by scanning contiguous segments of the same expiry.
+    let mut start_idx = 0;
+    while start_idx < grid.contracts.len() {
+        let expiry = &grid.contracts[start_idx].expiry;
+        let mut end_idx = start_idx + 1;
+        while end_idx < grid.contracts.len() && &grid.contracts[end_idx].expiry == expiry {
+            end_idx += 1;
         }
 
-        // Strike Monotonicity: Call mid prices should be decreasing in strike K
-        // Put mid prices should be increasing in strike K
-        for i in 0..(m - 1) {
-            let c1 = contracts[i];
-            let c2 = contracts[i + 1];
-            
-            if c1.option_type == 'C' && c2.option_type == 'C' {
-                if c2.mid > c1.mid {
-                    total_violation += c2.mid - c1.mid;
-                }
-            } else if c1.option_type == 'P' && c2.option_type == 'P' {
-                if c1.mid > c2.mid {
-                    total_violation += c1.mid - c2.mid;
+        // Segment of contracts for this expiry from start_idx to end_idx.
+        // We split them into call and put vectors to check monotonicity and convexity.
+        let mut segment_calls = Vec::with_capacity(32);
+        let mut segment_puts = Vec::with_capacity(32);
+        
+        for idx in start_idx..end_idx {
+            let c = &grid.contracts[idx];
+            if c.is_liquid {
+                if c.option_type == 'C' {
+                    segment_calls.push(c);
+                } else {
+                    segment_puts.push(c);
                 }
             }
         }
 
-        // Strike Convexity (Butterfly No-Arbitrage):
-        // Call / Put prices should be convex in strike
-        if m >= 3 {
-            for i in 1..(m - 1) {
-                let c_left = contracts[i - 1];
-                let c_mid = contracts[i];
-                let c_right = contracts[i + 1];
-
-                if c_left.option_type == c_mid.option_type && c_mid.option_type == c_right.option_type {
+        // Check call segment
+        let m_calls = segment_calls.len();
+        if m_calls >= 2 {
+            for i in 0..(m_calls - 1) {
+                let c1 = segment_calls[i];
+                let c2 = segment_calls[i + 1];
+                if c2.mid > c1.mid {
+                    total_violation += c2.mid - c1.mid;
+                }
+            }
+            if m_calls >= 3 {
+                for i in 1..(m_calls - 1) {
+                    let c_left = segment_calls[i - 1];
+                    let c_mid = segment_calls[i];
+                    let c_right = segment_calls[i + 1];
                     let k_l = c_left.strike;
                     let k_m = c_mid.strike;
                     let k_r = c_right.strike;
-                    
                     let y_l = c_left.mid;
                     let y_m = c_mid.mid;
                     let y_r = c_right.mid;
-
                     if k_m > k_l && k_r > k_m {
-                        // Discrete convexity: slope_right >= slope_left
                         let slope_l = (y_m - y_l) / (k_m - k_l);
                         let slope_r = (y_r - y_m) / (k_r - k_m);
-                        
                         if slope_l > slope_r {
                             total_violation += slope_l - slope_r;
                         }
@@ -94,6 +91,40 @@ pub fn compute_shape_violations(grid: &OptionGrid) -> f64 {
                 }
             }
         }
+
+        // Check put segment
+        let m_puts = segment_puts.len();
+        if m_puts >= 2 {
+            for i in 0..(m_puts - 1) {
+                let c1 = segment_puts[i];
+                let c2 = segment_puts[i + 1];
+                if c1.mid > c2.mid {
+                    total_violation += c1.mid - c2.mid;
+                }
+            }
+            if m_puts >= 3 {
+                for i in 1..(m_puts - 1) {
+                    let c_left = segment_puts[i - 1];
+                    let c_mid = segment_puts[i];
+                    let c_right = segment_puts[i + 1];
+                    let k_l = c_left.strike;
+                    let k_m = c_mid.strike;
+                    let k_r = c_right.strike;
+                    let y_l = c_left.mid;
+                    let y_m = c_mid.mid;
+                    let y_r = c_right.mid;
+                    if k_m > k_l && k_r > k_m {
+                        let slope_l = (y_m - y_l) / (k_m - k_l);
+                        let slope_r = (y_r - y_m) / (k_r - k_m);
+                        if slope_l > slope_r {
+                            total_violation += slope_l - slope_r;
+                        }
+                    }
+                }
+            }
+        }
+
+        start_idx = end_idx;
     }
 
     total_violation
